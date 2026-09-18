@@ -17,7 +17,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt::Display,
-    future::poll_fn,
     io,
     net::{IpAddr, SocketAddr},
     sync::{
@@ -26,7 +25,7 @@ use std::{
     },
 };
 
-use iroh_base::{EndpointAddr, EndpointId, PublicKey, RelayUrl, SecretKey, TransportAddr};
+use iroh_base::{EndpointAddr, EndpointId, RelayUrl, SecretKey, TransportAddr};
 use iroh_relay::{RelayConfig, RelayMap};
 use mapped_addrs::MultipathMappedAddr;
 use n0_error::{AnyError, anyerr, bail, e, stack_error};
@@ -43,7 +42,7 @@ use netwatch::{
     ip::LocalAddresses,
 };
 use noq::{
-    NetworkChangeHint, WeakConnectionHandle,
+    NetworkChangeHint, TokenStore,
     crypto::rustls::{QuicClientConfig, QuicServerConfig},
 };
 use rand::RngExt;
@@ -69,15 +68,17 @@ use crate::net_report::QuicConfig;
 use crate::{
     address_lookup::{self, AddressLookupFailed, EndpointData, UserData},
     defaults::timeouts::NET_REPORT_TIMEOUT,
-    endpoint::{RelayStatus, hooks::EndpointHooksList, quic::QuicTransportConfig},
+    endpoint::{
+        LocalTransportAddr, RelayStatus, hooks::EndpointHooksList, quic::QuicTransportConfig,
+    },
     metrics::EndpointMetrics,
     net_report::{self, IfStateDetails, Report},
     portmapper,
     runtime::Runtime,
     socket::{
         concurrent_read_map::ReadOnlyMap,
-        remote_map::{MappedAddrs, PathStateReceiver, RemoteInfo},
-        transports::{HomeRelayWatch, HomeRelayWatcher, TransportBiasMap},
+        remote_map::{MappedAddrs, PathSelector, PathStateReceiver, RemoteInfo},
+        transports::{HomeRelayWatch, HomeRelayWatcher},
     },
     tls::{
         self,
@@ -87,6 +88,7 @@ use crate::{
 
 mod metrics;
 
+pub(crate) mod biased_rtt_path_selector;
 pub(crate) mod concurrent_read_map;
 pub(crate) mod mapped_addrs;
 pub(crate) mod remote_map;
@@ -185,8 +187,9 @@ pub(crate) struct Options {
 
     pub(crate) metrics: EndpointMetrics,
     pub(crate) hooks: EndpointHooksList,
-    pub(crate) transport_bias: TransportBiasMap,
+    pub(crate) path_selector: Arc<dyn PathSelector>,
     pub(crate) portmapper_config: portmapper::PortmapperConfig,
+    pub(crate) net_report_config: crate::net_report::NetReportConfig,
 
     /// Static configuration for the endpoint.
     pub(crate) static_config: StaticConfig,
@@ -236,6 +239,8 @@ pub(crate) struct StaticConfig {
     pub(crate) client_config: QuicClientConfig,
     #[debug("Arc<RustlsTokenKey>")]
     pub(crate) token_key: Arc<RustlsTokenKey>,
+    #[debug("Arc<dyn TokenStore>")]
+    pub(crate) token_store: Arc<dyn TokenStore>,
     pub(crate) transport_config: QuicTransportConfig,
 }
 
@@ -263,6 +268,7 @@ impl StaticConfig {
         quic_client_config.set_alpn_protocols(alpn_protocols);
         let mut inner = noq::ClientConfig::new(Arc::new(quic_client_config));
         inner.transport_config(transport_config);
+        inner.token_store(self.token_store.clone());
         inner
     }
 }
@@ -336,9 +342,6 @@ pub(crate) struct Socket {
     /// A missing entry means no actor is running for that remote. Spawning new
     /// `RemoteStateActor`s must go through the socket actor channel.
     remote_actors: ReadOnlyMap<EndpointId, mpsc::Sender<RemoteStateMessage>>,
-
-    /// EndpointId of this endpoint.
-    public_key: PublicKey,
 
     // - Shutdown Management
     shutdown: ShutdownState,
@@ -473,6 +476,7 @@ impl Socket {
     ///
     /// [`Watcher`]: n0_watcher::Watcher
     /// [`Watcher::initialized`]: n0_watcher::Watcher::initialized
+    #[cfg(feature = "unstable-net-report")]
     pub(crate) fn net_report(&self) -> impl Watcher<Value = Option<Report>> + use<> {
         self.net_report.watch().map(|(r, _)| r)
     }
@@ -517,34 +521,31 @@ impl Socket {
         &self.dns_resolver
     }
 
-    /// Translates a raw [`SocketAddr`] (which may be a synthetic mapped address) into
-    /// a [`transports::Addr`].
+    /// Translates a possible IP-mapped [`SocketAddr`] into a [`transports::Addr`].
     ///
-    /// For regular IP addresses this returns `Addr::Ip`. For synthetic relay-mapped
-    /// IPv6 addresses this performs a reverse lookup and returns `Addr::Relay`.
-    ///
-    /// This lookup only makes sense for a remote address of the
-    /// underlying QUIC connection.
-    ///
-    /// If you call this with a mapped address for which no mapping exists,
-    /// it will return the address as an `Addr::Ip`.
-    pub(crate) fn to_transport_addr(&self, addr: SocketAddr) -> transports::Addr {
-        remote_map::to_transport_addr(
-            addr,
-            &self.mapped_addrs.relay_addrs,
-            &self.mapped_addrs.custom_addrs,
-        )
-        .unwrap_or(transports::Addr::Ip(addr))
+    /// For regular IP addresses this returns `Addr::Ip`. For mapped addresses this performs
+    /// a reverse lookup.
+    pub(crate) fn to_transport_addr(&self, addr: SocketAddr) -> Option<transports::Addr> {
+        self.mapped_addrs.to_transport_addr(addr)
     }
 
-    /// Reverse-resolves a custom mapped address back to its [`iroh_base::CustomAddr`].
-    pub(crate) fn lookup_custom_addr(&self, addr: SocketAddr) -> Option<iroh_base::CustomAddr> {
-        match MultipathMappedAddr::from(addr) {
-            MultipathMappedAddr::Custom(custom_mapped) => {
-                self.mapped_addrs.custom_addrs.lookup(&custom_mapped)
-            }
-            _ => None,
-        }
+    pub(crate) fn to_local_transport_addr(
+        &self,
+        local_ip: Option<IpAddr>,
+        remote_addr: SocketAddr,
+    ) -> LocalTransportAddr {
+        let remote_addr = self.to_transport_addr(remote_addr).unwrap_or_else(|| {
+            error!(
+                mapped_addr = ?remote_addr,
+                "Socket::to_local_transport_addr: invalid mapped address",
+            );
+            transports::Addr::Ip(remote_addr)
+        });
+        LocalTransportAddr::from_noq_local_ip(
+            local_ip,
+            &remote_addr,
+            &self.mapped_addrs.custom_addrs,
+        )
     }
 
     /// Reference to the internal Address Lookup
@@ -689,7 +690,7 @@ impl Socket {
     }
 }
 
-/// Manages currently running [`crate::NetReport`] to learn this endpoint's IP addresses.
+/// Manages currently running net reports to learn this endpoint's IP addresses.
 ///
 /// Invariants:
 /// - only one direct addr update must be running at a time
@@ -798,7 +799,7 @@ impl DirectAddrUpdateState {
         self.sock.metrics.net_report.portmap_attempts.inc();
         self.port_mapper.procure_mapping();
 
-        debug!("requesting net_report report");
+        trace!("requesting net_report report");
         let sock = self.sock.clone();
 
         let run_done = self.run_done.clone();
@@ -881,13 +882,15 @@ impl EndpointInner {
             tls_config,
             metrics,
             hooks,
-            transport_bias,
+            path_selector,
             portmapper_config,
+            net_report_config,
             static_config,
             configured_addrs,
         } = opts;
 
-        let address_lookup = address_lookup::AddressLookupServices::default();
+        let address_lookup =
+            address_lookup::AddressLookupServices::with_metrics(metrics.address_lookup.clone());
         let port_mapper = portmapper::create_client(&portmapper_config);
 
         let relay_transport_configs: Vec<_> = transport_configs
@@ -972,7 +975,7 @@ impl EndpointInner {
                 direct_addrs.addrs.watch(),
                 address_lookup.clone(),
                 shutdown_token.child_token(),
-                transport_bias,
+                path_selector,
                 span.clone(),
             )
         };
@@ -980,7 +983,6 @@ impl EndpointInner {
         let home_relay_watch = transports.home_relay_watch();
 
         let sock = Arc::new(Socket {
-            public_key: secret_key.public(),
             remote_actors: remote_map.senders(),
             shutdown: shutdown_state,
             ipv6_reported,
@@ -1043,11 +1045,14 @@ impl EndpointInner {
                 ipv4: true,
                 ipv6: has_ipv6_transport,
             });
-            net_report::Options::new(tls_config.clone()).quic_config(qad_config)
+            net_report::Options::new(tls_config.clone())
+                .quic_config(qad_config)
+                .proxy_url(proxy_url.clone())
+                .net_report_config(net_report_config)
         };
 
         #[cfg(wasm_browser)]
-        let net_report_config = net_report::Options::default();
+        let net_report_config = net_report::Options::default().net_report_config(net_report_config);
 
         let net_reporter = net_report::Client::new(
             #[cfg(not(wasm_browser))]
@@ -1125,7 +1130,7 @@ impl EndpointInner {
         if self.sock.is_closed() || self.sock.is_closing() {
             return;
         }
-        trace!(me = ?self.public_key, "socket closing...");
+        trace!("socket closing...");
 
         // Cancel at_close_start token, which cancels running netreports.
         self.sock.shutdown.at_close_start.cancel();
@@ -1151,9 +1156,9 @@ impl EndpointInner {
         // connection close codes, and close the endpoint properly.
         // If this call is skipped, then connections that protocols close just shortly before the
         // call to `Endpoint::close` will in most cases cause connection time-outs on remote ends.
-        trace!("wait_idle start");
-        self.noq_endpoint().wait_idle().await;
-        trace!("wait_idle done");
+        trace!("wait_all_draining start");
+        self.noq_endpoint().wait_all_draining().await;
+        trace!("wait_all_draining done");
 
         // Start cancellation of all actors.
         self.sock.shutdown.at_endpoint_closed.cancel();
@@ -1200,12 +1205,12 @@ impl EndpointInner {
     ///
     /// This should only be called in the `iroh::Endpoint` `Drop` impl when the
     /// `iroh::Endpoint` is dropped without first calling `Endpoint::close`.
-    #[instrument(skip_all)]
+    #[instrument(skip_all, parent = self.sock.span.clone())]
     pub(crate) fn abort(&self) {
         if self.sock.is_closed() || self.sock.is_closing() {
             return;
         }
-        trace!(me = ?self.public_key, "aborting socket...");
+        trace!("socket aborting...");
 
         // Cancel at_close_start token, which cancels running netreports.
         self.sock.shutdown.at_close_start.cancel();
@@ -1350,7 +1355,7 @@ impl EndpointInner {
     pub(crate) fn register_connection(
         &self,
         remote: EndpointId,
-        conn: WeakConnectionHandle,
+        conn: noq::Connection,
     ) -> impl Future<Output = Result<PathStateReceiver, RemoteStateActorStoppedError>> + Send + 'static
     {
         let (tx, rx) = oneshot::channel();
@@ -1378,7 +1383,7 @@ enum ActorMessage {
     #[debug("AddConnection(..)")]
     AddConnection(
         EndpointId,
-        WeakConnectionHandle,
+        noq::Connection,
         oneshot::Sender<PathStateReceiver>,
     ),
     /// Re-evaluate direct addresses, e.g. after configured external addresses changed.
@@ -1603,9 +1608,7 @@ impl Actor {
                     self.sock.metrics.socket.actor_link_change.inc();
                     self.handle_network_change(is_major);
                 }
-                remote_id = poll_fn(|cx| self.remote_map.poll_cleanup(cx)) => {
-                    trace!(%remote_id, "cleaned up RemoteStateActor");
-                }
+                _remote_id = self.remote_map.cleanup() => {},
                 _ = &mut notify_quic_network_change => {
                     let has_network = self.has_usable_network();
                     let Some(pending) = self.call_notify_quic_network_change.as_mut() else {
@@ -1775,16 +1778,10 @@ impl Actor {
                 self.handle_relay_map_change();
             }
             ActorMessage::ResolveRemote(addr, tx) => {
-                // Swallowing the error is fine here; if a send on the channel to the
-                // remote state actor ever fails (which it shouldn't), `tx` will be
-                // dropped and thus the failure will be propagated to the caller.
-                self.remote_map.resolve_remote(addr, tx).await.ok();
+                self.remote_map.resolve_remote(addr, tx).await;
             }
             ActorMessage::AddConnection(remote, conn, tx) => {
-                // Swallowing the error is fine here; if a send on the channel to the
-                // remote state actor ever fails (which it shouldn't), `tx` will be
-                // dropped and thus the failure will be propagated to the caller.
-                self.remote_map.add_connection(remote, conn, tx).await.ok();
+                self.remote_map.add_connection(remote, conn, tx).await;
             }
             ActorMessage::DirectAddrRefresh => {
                 #[cfg(not(wasm_browser))]
@@ -2120,7 +2117,7 @@ mod tests {
 
     use data_encoding::HEXLOWER;
     use iroh_base::{EndpointAddr, EndpointId, TransportAddr};
-    use iroh_relay::tls::{CaRootsConfig, default_provider};
+    use iroh_relay::tls::{CaTlsConfig, default_provider};
     use n0_error::{Result, StackResultExt, StdResultExt};
     use n0_future::{MergeBounded, StreamExt, time};
     use n0_tracing_test::traced_test;
@@ -2137,6 +2134,7 @@ mod tests {
         endpoint::{QuicTransportConfig, presets},
         socket::{
             EndpointInner, StaticConfig, TransportConfig,
+            biased_rtt_path_selector::BiasedRttPathSelector,
             mapped_addrs::{EndpointIdMappedAddr, MappedAddr},
         },
         tls::{self, DEFAULT_MAX_TLS_TICKETS, misc::RustlsTokenKey},
@@ -2157,6 +2155,7 @@ mod tests {
             client_config: tls_config.make_client_config(false).unwrap(),
             tls_config,
             token_key: Arc::new(RustlsTokenKey::new(rng, &crypto_provider).unwrap()),
+            token_store: Arc::new(noq::TokenMemoryCache::default()),
             transport_config: QuicTransportConfig::default(),
         };
         let server_config = static_config.create_server_config(vec![]);
@@ -2169,15 +2168,16 @@ mod tests {
             proxy_url: None,
             dns_resolver: DnsResolver::new(),
             server_config,
-            tls_config: CaRootsConfig::default()
+            tls_config: CaTlsConfig::default()
                 .client_config(crypto_provider.clone())
                 .unwrap(),
             #[cfg(any(test, feature = "test-utils"))]
             address_lookup_user_data: None,
             metrics: Default::default(),
             hooks: Default::default(),
-            transport_bias: Default::default(),
+            path_selector: Arc::new(BiasedRttPathSelector::default()),
             portmapper_config: Default::default(),
+            net_report_config: Default::default(),
             static_config,
             configured_addrs: Default::default(),
         }
@@ -2206,7 +2206,6 @@ mod tests {
 
         info!("finishing");
         send_bi.finish().std_context("finish")?;
-        send_bi.stopped().await.std_context("stopped")?;
 
         let stats = conn.stats();
         info!("stats: {:#?}", stats);
@@ -2247,7 +2246,6 @@ mod tests {
 
         info!("finishing");
         send_bi.finish().std_context("finish")?;
-        send_bi.stopped().await.std_context("stopped")?;
 
         info!("reading_to_end");
         let val = recv_bi
@@ -2294,7 +2292,7 @@ mod tests {
         payload: &[u8],
         loss: ExpectedLoss,
     ) -> Result<()> {
-        tokio::time::timeout(Duration::from_secs(4), async move {
+        tokio::time::timeout(Duration::from_secs(20), async move {
             let send_endpoint_id = sender.id();
             let recv_endpoint_id = receiver.id();
             info!("\nroundtrip: {send_endpoint_id:#} -> {recv_endpoint_id:#}");
@@ -2572,6 +2570,7 @@ mod tests {
             client_config: tls_config.make_client_config(keylog).unwrap(),
             tls_config,
             token_key: Arc::new(RustlsTokenKey::new(&mut rand::rng(), &crypto_provider).unwrap()),
+            token_store: Arc::new(noq::TokenMemoryCache::default()),
             transport_config: QuicTransportConfig::default(),
         };
         let server_config = static_config.create_server_config(vec![ALPN.to_vec()]);
@@ -2587,13 +2586,14 @@ mod tests {
             dns_resolver,
             proxy_url: None,
             server_config,
-            tls_config: CaRootsConfig::default()
+            tls_config: CaTlsConfig::default()
                 .client_config(crypto_provider.clone())
                 .unwrap(),
             metrics: Default::default(),
             hooks: Default::default(),
-            transport_bias: Default::default(),
+            path_selector: Arc::new(BiasedRttPathSelector::default()),
             portmapper_config: Default::default(),
+            net_report_config: Default::default(),
             static_config,
             configured_addrs: Default::default(),
         };
@@ -2613,6 +2613,7 @@ mod tests {
     ) -> Result<noq::Connection> {
         // Endpoint::connect sets this, do the same to have similar behaviour.
         let mut transport_config = noq::TransportConfig::default();
+        transport_config.server_handshake_migration(true);
         transport_config.keep_alive_interval(Some(Duration::from_secs(1)));
 
         socket_connect_with_transport_config(
@@ -2810,6 +2811,7 @@ mod tests {
         // with the next handshake, closing it during the handshake.  This makes the test a
         // little slower though.
         let mut transport_config = noq::TransportConfig::default();
+        transport_config.server_handshake_migration(true);
         transport_config.max_idle_timeout(Some(Duration::from_millis(200).try_into().unwrap()));
         let res = socket_connect_with_transport_config(
             sock_1.noq_endpoint().clone(),

@@ -8,7 +8,10 @@ use n0_future::{SinkExt, StreamExt};
 use rand::RngExt;
 use time::{Date, OffsetDateTime};
 use tokio::{
-    sync::mpsc::{self, error::TrySendError},
+    sync::{
+        mpsc::{self, error::TrySendError},
+        watch,
+    },
     time::MissedTickBehavior,
 };
 use tokio_util::{sync::CancellationToken, task::AbortOnDropHandle};
@@ -26,6 +29,7 @@ use crate::{
         streams::BytesStreamSink,
     },
     server::{
+        ConnectionId, OnDisconnectGuard,
         clients::Clients,
         metrics::Metrics,
         streams::{RecvError as RelayRecvError, RelayedStream, SendError as RelaySendError},
@@ -41,14 +45,16 @@ pub(super) struct Packet {
     data: Datagrams,
 }
 
-/// Configuration for a [`Client`].
+/// Configuration for a client connection.
 ///
 /// Generic over the stream type to support different WebSocket implementations.
 #[derive(Debug)]
 #[non_exhaustive]
 pub struct Config<S> {
-    /// The endpoint ID of the client
-    pub endpoint_id: EndpointId,
+    /// Reports the disconnect once the connection ends.
+    ///
+    /// Also the owner of this connection's [`EndpointId`] and [`ConnectionId`].
+    pub guard: OnDisconnectGuard,
     /// The relayed stream connection
     pub stream: RelayedStream<S>,
     /// Write timeout for the client connection
@@ -57,21 +63,30 @@ pub struct Config<S> {
     pub channel_capacity: usize,
     /// Protocol version negotiated for this client
     pub protocol_version: ProtocolVersion,
+    /// Optional signal to inform the client when it is being rate-limited.
+    ///
+    /// When set, the connection actor notifies the client once with a
+    /// [`Status::RateLimited`] message when the rate-limited counter first
+    /// becomes non-zero.
+    pub(crate) rate_limited: Option<watch::Receiver<u64>>,
 }
 
 impl<S> Config<S> {
     /// Creates a new config with sensible default values for `write_timeout` and `channel_capacity`.
+    ///
+    /// The endpoint and connection ids are taken from `guard`.
     pub fn new(
-        endpoint_id: EndpointId,
+        guard: OnDisconnectGuard,
         stream: RelayedStream<S>,
         protocol_version: ProtocolVersion,
     ) -> Self {
         Self {
-            endpoint_id,
+            guard,
             stream,
             protocol_version,
             write_timeout: SERVER_WRITE_TIMEOUT,
             channel_capacity: PER_CLIENT_SEND_QUEUE_DEPTH,
+            rate_limited: None,
         }
     }
 }
@@ -81,11 +96,11 @@ impl<S> Config<S> {
 /// [`Server`]: crate::server::Server
 /// [`Client`]: crate::client::Client
 #[derive(Debug)]
-pub struct Client {
+pub(super) struct Client {
     /// Identity of the connected peer.
     endpoint_id: EndpointId,
     /// Connection identifier.
-    connection_id: u64,
+    connection_id: ConnectionId,
     /// Used to close the connection loop.
     done: CancellationToken,
     /// Actor handle.
@@ -101,23 +116,25 @@ pub struct Client {
 impl Client {
     /// Creates a client from a connection & starts a read and write loop to handle io to and from
     /// the client
+    ///
+    /// The `guard` is moved into the connection actor and reports the disconnect to access
+    /// control once the connection ends.
+    ///
     /// Call [`Client::shutdown`] to close the read and write loops before dropping the [`Client`]
-    pub(super) fn new<S>(
-        config: Config<S>,
-        connection_id: u64,
-        clients: &Clients,
-        metrics: Arc<Metrics>,
-    ) -> Client
+    pub(super) fn new<S>(config: Config<S>, clients: &Clients, metrics: Arc<Metrics>) -> Client
     where
         S: BytesStreamSink + Send + 'static,
     {
         let Config {
-            endpoint_id,
+            guard,
             stream,
             write_timeout,
             channel_capacity,
             protocol_version,
+            rate_limited,
         } = config;
+        let endpoint_id = guard.endpoint_id;
+        let connection_id = guard.connection_id;
 
         let (packet_send_queue_s, packet_send_queue_r) = mpsc::channel(channel_capacity);
         let (message_send_queue_s, message_send_queue_r) = mpsc::channel(channel_capacity);
@@ -128,11 +145,12 @@ impl Client {
             timeout: write_timeout,
             packet_send_queue: packet_send_queue_r,
             message_send_queue: message_send_queue_r,
-            endpoint_id,
-            connection_id,
+            guard,
             clients: clients.clone(),
             client_counter: ClientCounter::default(),
             ping_tracker: PingTracker::default(),
+            protocol_version,
+            rate_limited,
             metrics,
         };
 
@@ -141,7 +159,7 @@ impl Client {
         let handle = tokio::task::spawn(actor.run(io_done).instrument(tracing::info_span!(
             "client-connection-actor",
             remote_endpoint = %endpoint_id.fmt_short(),
-            connection_id = connection_id
+            connection_id = %connection_id
         )));
 
         Client {
@@ -155,7 +173,7 @@ impl Client {
         }
     }
 
-    pub(super) fn connection_id(&self) -> u64 {
+    pub(super) fn connection_id(&self) -> ConnectionId {
         self.connection_id
     }
 
@@ -204,6 +222,21 @@ impl Client {
             },
         };
         self.message_queue.try_send(message)
+    }
+}
+
+/// Completes when `rx` observes the connection being rate-limited.
+///
+/// Pends forever when `rx` is `None`, i.e. when no rate-limit signal is configured.
+async fn rate_limited_signal(rx: &mut Option<watch::Receiver<u64>>) -> bool {
+    match rx {
+        Some(rx) => match rx.changed().await {
+            Ok(()) => *rx.borrow_and_update() > 0,
+            // The sender lives inside this actor's stream, so it cannot drop while
+            // the actor runs. Report not limited to be safe.
+            Err(_) => false,
+        },
+        None => std::future::pending().await,
     }
 }
 
@@ -290,15 +323,19 @@ struct Actor<S> {
     packet_send_queue: mpsc::Receiver<Packet>,
     /// Receiver for non-packet messages to be sent to the client.
     message_send_queue: mpsc::Receiver<RelayToClientMsg>,
-    /// [`EndpointId`] of this client
-    endpoint_id: EndpointId,
-    /// Connection identifier.
-    connection_id: u64,
+    /// Reports the disconnect to access control when dropped.
+    ///
+    /// Also the owner of this connection's [`EndpointId`] and [`ConnectionId`].
+    guard: OnDisconnectGuard,
     /// Reference to the other connected clients.
     clients: Clients,
     /// Statistics about the connected clients
     client_counter: ClientCounter,
     ping_tracker: PingTracker,
+    /// Relay protocol version negotiated for this client.
+    protocol_version: ProtocolVersion,
+    /// Optional signal counting how often the connection has been rate-limited.
+    rate_limited: Option<watch::Receiver<u64>>,
     metrics: Arc<Metrics>,
 }
 
@@ -311,7 +348,7 @@ where
         // connection is accepted long before this in the HTTP server, but it is clearer to
         // handle the metric here.
         self.metrics.accepts.inc();
-        if self.client_counter.update(self.endpoint_id) {
+        if self.client_counter.update(self.guard.endpoint_id()) {
             self.metrics.unique_client_keys.inc();
         }
         match self.run_inner(done).await {
@@ -323,8 +360,7 @@ where
             }
         }
 
-        self.clients
-            .unregister(self.connection_id, self.endpoint_id, &self.metrics);
+        self.clients.unregister(self.guard, &self.metrics);
         self.metrics.disconnects.inc();
     }
 
@@ -340,6 +376,8 @@ where
         ping_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
         ping_interval.tick().await;
 
+        let mut rate_limit_notified = false;
+
         loop {
             tokio::select! {
                 biased;
@@ -349,6 +387,17 @@ where
                     // final flush
                     self.stream.flush().await.map_err(|_| e!(RunError::Flush))?;
                     break;
+                }
+                limited = rate_limited_signal(&mut self.rate_limited), if !rate_limit_notified => {
+                    // Notify the client once per connection.
+                    // V1 clients are not notified.
+                    rate_limit_notified = true;
+                    if limited && self.protocol_version == ProtocolVersion::V2 {
+                        debug!("connection is rate-limited, notifying client");
+                        self.write_frame(RelayToClientMsg::Status(Status::RateLimited))
+                            .await
+                            .map_err(|err| e!(RunError::WriteFrame, err))?;
+                    }
                 }
                 maybe_frame = self.stream.next() => {
                     self
@@ -366,7 +415,7 @@ where
                 }
                 // Last priority, sending other message
                 message = self.message_send_queue.recv() => {
-                    let message = message .ok_or_else(|| e!(RunError::HandleDropped))?;
+                    let message = message.ok_or_else(|| e!(RunError::HandleDropped))?;
                     trace!("send {message:?}");
                     self.write_frame(message)
                         .await
@@ -479,7 +528,7 @@ where
     ) -> Result<(), ForwardPacketError> {
         self.metrics.send_packets_recv.inc();
         self.clients
-            .send_packet(dst, data, self.endpoint_id, &self.metrics)?;
+            .send_packet(dst, data, self.guard.endpoint_id(), &self.metrics)?;
 
         Ok(())
     }
@@ -594,11 +643,12 @@ mod tests {
             timeout: Duration::from_secs(1),
             packet_send_queue: send_queue_r,
             message_send_queue: message_r,
-            connection_id: 0,
-            endpoint_id,
+            guard: OnDisconnectGuard::empty(endpoint_id),
             clients: clients.clone(),
             client_counter: ClientCounter::default(),
             ping_tracker: PingTracker::default(),
+            protocol_version: ProtocolVersion::V2,
+            rate_limited: None,
             metrics,
         };
 
@@ -677,16 +727,11 @@ mod tests {
         protocol_version: ProtocolVersion,
     ) -> (Config<WsBytesFramed<RateLimited<MaybeTlsStream>>>, Conn) {
         let (server, client) = tokio::io::duplex(1024);
-        (
-            Config {
-                endpoint_id: key,
-                stream: ServerRelayedStream::test(server),
-                write_timeout: Duration::from_secs(1),
-                channel_capacity: 10,
-                protocol_version,
-            },
-            Conn::test(client, protocol_version),
-        )
+        let guard = OnDisconnectGuard::empty(key);
+        let mut config = Config::new(guard, ServerRelayedStream::test(server), protocol_version);
+        config.write_timeout = Duration::from_secs(1);
+        config.channel_capacity = 10;
+        (config, Conn::test(client, protocol_version))
     }
 
     #[tokio::test]
@@ -815,7 +860,7 @@ mod tests {
         let (io_read, io_write) = tokio::io::duplex((LIMIT * MAX_FRAMES) as _);
         let mut frame_writer = Conn::test(io_write, Default::default());
         // Rate limiter allowing LIMIT bytes/s
-        let mut stream = RelayedStream::test_limited(io_read, LIMIT / 10, LIMIT)?;
+        let (mut stream, _limited) = RelayedStream::test_limited(io_read, LIMIT / 10, LIMIT)?;
 
         // Prepare a frame to send, assert its size.
         let data = Datagrams::from(b"hello world!!!!!");
@@ -858,6 +903,42 @@ mod tests {
             .expect("ok");
         assert_eq!(recv_frame, frame);
 
+        Ok(())
+    }
+
+    /// A client whose connection is rate-limited receives a [`Status::RateLimited`] notice.
+    #[tokio::test(start_paused = true)]
+    #[traced_test]
+    async fn test_rate_limit_notice() -> Result {
+        const LIMIT: u32 = 50;
+
+        let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(0u64);
+        let key = SecretKey::from_bytes(&rng.random()).public();
+        let target = SecretKey::from_bytes(&rng.random()).public();
+
+        let (server_io, client_io) = tokio::io::duplex(4096);
+        // Rate limiter allowing LIMIT bytes/s with a burst size below a single frame.
+        let (stream, limited) = ServerRelayedStream::test_limited(server_io, LIMIT / 10, LIMIT)?;
+        let mut config = Config::new(OnDisconnectGuard::empty(key), stream, ProtocolVersion::V2);
+        config.write_timeout = Duration::from_secs(1);
+        config.channel_capacity = 10;
+        config.rate_limited = Some(limited);
+        let mut conn = Conn::test(client_io, ProtocolVersion::V2);
+
+        let clients = Clients::default();
+        clients.register(config, Arc::new(Metrics::default()));
+
+        // A single frame larger than the burst size trips the rate limiter.
+        conn.send(ClientToRelayMsg::Datagrams {
+            dst_endpoint_id: target,
+            datagrams: Datagrams::from(b"hello world!!!!!"),
+        })
+        .await?;
+
+        let frame = recv_frame(FrameType::Status, &mut conn).await?;
+        assert_eq!(frame, RelayToClientMsg::Status(Status::RateLimited));
+
+        clients.shutdown().await;
         Ok(())
     }
 }

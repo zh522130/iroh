@@ -3,10 +3,10 @@
 //! To connect to an iroh endpoint a [`EndpointAddr`] is needed, which may contain a
 //! [`RelayUrl`] or one or more *direct addresses* in addition to the [`EndpointId`].
 //!
-//! Since there is a conversion from [`EndpointId`] to [`EndpointAddr`], you can also use
+//! Since there is a conversion from [`EndpointId`] to [`EndpointAddr`], you can also
 //! connect directly with a [`EndpointId`].
 //!
-//! For this to work however, the endpoint has to get the addressing  information by
+//! For this to work however, the endpoint has to get the addressing information by
 //! other means.
 //!
 //! [`AddressLookup`] is an automated system for an [`Endpoint`] to retrieve this addressing
@@ -50,9 +50,9 @@
 //! [`iroh-mdns-address-lookup`]: https://docs.rs/iroh-mdns-address-lookup
 //! [`iroh-mainline-address-lookup`]: https://docs.rs/iroh-mainline-address-lookup
 //!
-//! To use multiple Address Lookup'ssimultaneously you can call [`Builder::address_lookup`].
+//! To use multiple Address Lookups simultaneously you can call [`Builder::address_lookup`].
 //! This will use [`AddressLookupServices`] under the hood, which performs lookups to all
-//! Address Lookupsystems at the same time.
+//! Address Lookup systems at the same time.
 //!
 //! [`Builder::address_lookup`] takes any type that implements [`AddressLookupBuilder`]. You can
 //! implement that trait on a builder struct if your Address Lookup needs information
@@ -60,8 +60,8 @@
 //! is built by calling [`AddressLookupBuilder::into_address_lookup`], passing the finished [`Endpoint`] to your
 //! builder.
 //!
-//! If your Address Lookupdoes not need any information from its endpoint, you can
-//! pass the Address Lookupservice directly to [`Builder::address_lookup`]: All types that
+//! If your Address Lookup does not need any information from its endpoint, you can
+//! pass the Address Lookup service directly to [`Builder::address_lookup`]: All types that
 //! implement [`AddressLookup`] also have a blanket implementation of [`AddressLookupBuilder`].
 //!
 //! # Examples
@@ -120,11 +120,13 @@ use crate::{Endpoint, endpoint::EndpointError};
 #[cfg(not(wasm_browser))]
 pub mod dns;
 pub mod memory;
+mod metrics;
 pub mod pkarr;
 
 #[cfg(not(wasm_browser))]
 pub use dns::*;
 pub use memory::*;
+pub use metrics::{Metrics, ServiceLabels};
 pub use pkarr::*;
 
 /// Trait for structs that can be converted into [`AddressLookup`]s.
@@ -334,7 +336,7 @@ pub trait AddressLookup: std::fmt::Debug + Send + Sync + 'static {
     /// Publishes the given [`EndpointData`] to the Address Lookup mechanism.
     ///
     /// This is fire and forget, since the [`Endpoint`] can not wait for successful
-    /// publishing. If publishing is async, the implementation should start it's own task.
+    /// publishing. If publishing is async, the implementation should start its own task.
     ///
     /// This will be called from a tokio task, so it is safe to spawn new tasks.
     /// These tasks will be run on the runtime of the [`super::Endpoint`].
@@ -369,7 +371,7 @@ impl<T: AddressLookup> AddressLookup for Arc<T> {
 /// directly from [`Item`].
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct Item {
-    /// The endpoint info for the endpoint, as discovered by the the Address Lookup.
+    /// The endpoint info for the endpoint, as discovered by the Address Lookup.
     endpoint_info: EndpointInfo,
     /// A static string to identify the Address Lookup source.
     ///
@@ -421,12 +423,12 @@ impl Item {
         self.last_updated
     }
 
-    /// Converts into a [`EndpointAddr`] by cloning the needed fields.
+    /// Returns an [`EndpointAddr`] by cloning the needed fields.
     pub fn to_endpoint_addr(&self) -> EndpointAddr {
         self.endpoint_info.to_endpoint_addr()
     }
 
-    /// Converts into a [`EndpointAddr`] without cloning.
+    /// Converts into an [`EndpointAddr`] without cloning.
     pub fn into_endpoint_addr(self) -> EndpointAddr {
         self.endpoint_info.into_endpoint_addr()
     }
@@ -457,7 +459,7 @@ impl From<Item> for EndpointInfo {
 ///
 /// See [`AddressLookup`] and [`Self::resolve`] for details.
 ///
-/// [`Endpoint]: crate::Endpoint
+/// [`Endpoint`]: crate::Endpoint
 #[derive(Debug, Default, Clone)]
 pub struct AddressLookupServices {
     services: Arc<RwLock<Vec<Box<dyn AddressLookup>>>>,
@@ -465,9 +467,19 @@ pub struct AddressLookupServices {
     last_data: Arc<RwLock<Option<EndpointData>>>,
     /// Optional filter applied to all data before publishing to any service.
     addr_filter: Arc<RwLock<Option<AddrFilter>>>,
+    /// Metrics for lookup outcomes.
+    metrics: Arc<Metrics>,
 }
 
 impl AddressLookupServices {
+    /// Creates a registry recording lookup outcomes in `metrics`.
+    pub(crate) fn with_metrics(metrics: Arc<Metrics>) -> Self {
+        Self {
+            metrics,
+            ..Default::default()
+        }
+    }
+
     /// Sets the address filter applied before publishing to any service.
     ///
     /// When set, all address data is filtered once before being distributed
@@ -554,14 +566,15 @@ impl AddressLookupServices {
         &self,
         endpoint_id: EndpointId,
     ) -> impl Stream<Item = Result<Result<Item, Error>, AddressLookupFailed>> + use<> {
+        self.metrics.lookups.inc();
         let services = self.services.read().expect("poisoned");
         if services.is_empty() {
-            AddressLookupStream::empty()
+            AddressLookupStream::empty(self.metrics.clone())
         } else {
             let streams = services
                 .iter()
                 .filter_map(|service| service.resolve(endpoint_id));
-            AddressLookupStream::new(streams)
+            AddressLookupStream::new(streams, self.metrics.clone())
         }
     }
 }
@@ -584,24 +597,30 @@ struct AddressLookupStream {
     errors: Vec<Error>,
     did_emit: bool,
     closed: bool,
+    metrics: Arc<Metrics>,
 }
 
 impl AddressLookupStream {
-    fn empty() -> Self {
+    fn empty(metrics: Arc<Metrics>) -> Self {
         Self {
             streams: None,
             errors: Vec::new(),
             did_emit: false,
             closed: false,
+            metrics,
         }
     }
 
-    fn new(streams: impl Iterator<Item = BoxStream<Result<Item, Error>>>) -> Self {
+    fn new(
+        streams: impl Iterator<Item = BoxStream<Result<Item, Error>>>,
+        metrics: Arc<Metrics>,
+    ) -> Self {
         Self {
             streams: Some(MergeBounded::from_iter(streams)),
             errors: Vec::new(),
             did_emit: false,
             closed: false,
+            metrics,
         }
     }
 }
@@ -621,22 +640,32 @@ impl Stream for AddressLookupStream {
             Some(inner) => inner,
             None => {
                 this.closed = true;
+                this.metrics.lookups_failed.inc();
                 return Poll::Ready(Some(Err(e!(AddressLookupFailed::NoServiceConfigured))));
             }
         };
         let item = match ready!(Pin::new(&mut inner).poll_next(cx)) {
             Some(Ok(item)) => {
                 this.did_emit = true;
+                this.metrics
+                    .service_results
+                    .get_or_create(&ServiceLabels::new(item.provenance()))
+                    .inc();
                 Some(Ok(Ok(item)))
             }
             Some(Err(error)) => {
                 debug!("address lookup error: {error:#}");
+                this.metrics
+                    .service_errors
+                    .get_or_create(&ServiceLabels::new(error.provenance))
+                    .inc();
                 this.errors.push(error.clone());
                 Some(Ok(Err(error)))
             }
             None => {
                 this.closed = true;
                 if !this.did_emit {
+                    this.metrics.lookups_failed.inc();
                     let errors = std::mem::take(&mut this.errors);
                     Some(Err(e!(AddressLookupFailed::NoResults { errors })))
                 } else {
@@ -1000,6 +1029,35 @@ mod tests {
         Ok(())
     }
 
+    /// Regression test: Pending address lookup must keep the `RemoteStateActor` alive.
+    ///
+    /// Previously, this test failed with an `InternalConsistencyError` because the
+    /// `RemoteStateActor` was marked idle and shut down while there were pending
+    /// `ResolveRemote` requests still queued.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    #[traced_test]
+    async fn pending_resolve_survives_actor_idle_timeout() -> Result {
+        let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(0u64);
+        let ep = Endpoint::builder(presets::Minimal)
+            .secret_key(SecretKey::from_bytes(&rng.random()))
+            .bind()
+            .await?;
+        ep.address_lookup()
+            .expect("endpoint is still open")
+            .add(HangingAddressLookup);
+
+        let offline_id = SecretKey::from_bytes(&rng.random()).public();
+        let connect_task = tokio::spawn(async move { ep.connect(offline_id, TEST_ALPN).await });
+
+        // `iroh::socket::remote_map::remote_state::ACTOR_MAX_IDLE_TIMEOUT`
+        // is 60s. Sleep for longer so that we are sure that the idle timeout expired.
+        let res = time::timeout(Duration::from_secs(65), connect_task).await;
+        // We expect the timeout to elapse, because the address lookup does not resolve.
+        // Before the fix, this would produce an `InternalConsistencyError` after the actor's idle timeout expired.
+        assert!(res.is_err(), "expected Elapsed, got {res:?}");
+        Ok(())
+    }
+
     /// Concurrent `connect` calls to the same peer must both wait for the in-flight address lookup.
     ///
     /// Reproduces the race where the second `ResolveRemote` for the same
@@ -1111,6 +1169,59 @@ mod tests {
         Ok(())
     }
 
+    /// Lookup outcomes are counted per service.
+    #[tokio::test]
+    #[traced_test]
+    async fn address_lookup_metrics() -> Result {
+        let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(0u64);
+        let endpoint_id = SecretKey::from_bytes(&rng.random()).public();
+
+        // One succeeding and one failing service.
+        let succeeding = MemoryLookup::with_provenance("static-test");
+        let data = EndpointData::from_iter([TransportAddr::Ip("127.0.0.1:1".parse().unwrap())]);
+        succeeding.add_endpoint_info(EndpointInfo::from_parts(endpoint_id, data));
+        let services = AddressLookupServices::default();
+        services.add(succeeding);
+        services.add(FailingAddressLookup {
+            delay: Duration::from_millis(10),
+        });
+        let _results: Vec<_> = services.resolve(endpoint_id).collect().await;
+
+        let metrics = &services.metrics;
+        assert_eq!(metrics.lookups.get(), 1);
+        assert_eq!(metrics.lookups_failed.get(), 0);
+        assert_eq!(
+            metrics
+                .service_results
+                .get(&ServiceLabels::new("static-test"))
+                .map(|counter| counter.get()),
+            Some(1)
+        );
+        assert_eq!(
+            metrics
+                .service_errors
+                .get(&ServiceLabels::new("failing-test"))
+                .map(|counter| counter.get()),
+            Some(1)
+        );
+
+        // Only failing services: the lookup itself is counted as failed.
+        let services = AddressLookupServices::default();
+        services.add(FailingAddressLookup {
+            delay: Duration::from_millis(10),
+        });
+        let _results: Vec<_> = services.resolve(endpoint_id).collect().await;
+        assert_eq!(services.metrics.lookups_failed.get(), 1);
+
+        // No services configured: also counted as failed.
+        let services = AddressLookupServices::default();
+        let _results: Vec<_> = services.resolve(endpoint_id).collect().await;
+        assert_eq!(services.metrics.lookups.get(), 1);
+        assert_eq!(services.metrics.lookups_failed.get(), 1);
+
+        Ok(())
+    }
+
     #[test]
     fn concurrent_address_lookup_addr_filter() {
         use iroh_base::RelayUrl;
@@ -1214,7 +1325,7 @@ mod tests {
 mod test_dns_pkarr {
     use iroh_base::{EndpointAddr, SecretKey, TransportAddr};
     use iroh_dns::endpoint_info::UserData;
-    use iroh_relay::tls::{CaRootsConfig, default_provider};
+    use iroh_relay::tls::{CaTlsConfig, default_provider};
     use n0_error::{Result, StackResultExt};
     use n0_future::time::Duration;
     use n0_tracing_test::traced_test;
@@ -1274,7 +1385,7 @@ mod test_dns_pkarr {
             "https://relay.example".parse().unwrap(),
         ));
 
-        let tls_config = CaRootsConfig::insecure_skip_verify()
+        let tls_config = CaTlsConfig::insecure_skip_verify()
             .client_config(default_provider())
             .expect("infallible");
         let resolver = dns_pkarr_server.dns_resolver();
@@ -1345,7 +1456,7 @@ mod test_dns_pkarr {
         let secret_key = SecretKey::from_bytes(&rng.random());
         let ep = Endpoint::builder(presets::Minimal)
             .relay_mode(RelayMode::Custom(relay_map.clone()))
-            .ca_roots_config(CaRootsConfig::insecure_skip_verify())
+            .ca_tls_config(CaTlsConfig::insecure_skip_verify())
             .secret_key(secret_key.clone())
             .alpns(vec![TEST_ALPN.to_vec()])
             .preset(dns_pkarr_server.preset())

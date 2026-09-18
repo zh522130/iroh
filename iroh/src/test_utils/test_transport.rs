@@ -234,6 +234,7 @@ impl CustomSender for TestSender {
         &self,
         _cx: &mut std::task::Context,
         dst: &CustomAddr,
+        _src: Option<&CustomAddr>,
         transmit: &Transmit<'_>,
     ) -> Poll<io::Result<()>> {
         let packets = self.split(transmit).collect();
@@ -330,7 +331,7 @@ mod tests {
         Endpoint, EndpointAddr, RelayMode, SecretKey, TransportAddr,
         endpoint::{Builder, Connection, presets, transports::AddrKind},
         protocol::{AcceptError, ProtocolHandler, Router},
-        socket::transports::TransportBias,
+        socket::biased_rtt_path_selector::{BiasedRttPathSelector, TransportBias},
         test_utils::run_relay_server,
     };
 
@@ -387,10 +388,13 @@ mod tests {
         let mut builder = Endpoint::builder(presets::N0)
             .secret_key(secret_key)
             .relay_mode(relay_mode)
-            .ca_roots_config(crate::tls::CaRootsConfig::insecure_skip_verify())
+            .ca_tls_config(crate::tls::CaTlsConfig::insecure_skip_verify())
             .add_custom_transport(transport);
         if let Some(bias) = config.custom_bias {
-            builder = builder.transport_bias(AddrKind::Custom(TEST_TRANSPORT_ID), bias);
+            builder = builder.path_selector(Arc::new(
+                BiasedRttPathSelector::default()
+                    .with_bias(AddrKind::Custom(TEST_TRANSPORT_ID), bias),
+            ));
         }
         if !config.keep_ip {
             builder = builder.clear_ip_transports();
@@ -503,7 +507,7 @@ mod tests {
     #[tokio::test]
     #[traced_test]
     async fn test_custom_transport_local_addr() -> Result<()> {
-        use crate::endpoint::IncomingLocalAddr;
+        use crate::endpoint::LocalTransportAddr;
 
         let network = TestNetwork::new();
         let s1 = SecretKey::generate();
@@ -529,7 +533,7 @@ mod tests {
         let incoming = ep2.accept().await.expect("incoming");
         assert_eq!(
             incoming.local_addr(),
-            IncomingLocalAddr::Custom(Some(to_custom_addr(s2.public()))),
+            LocalTransportAddr::Custom(Some(to_custom_addr(s2.public()))),
         );
         let _conn = incoming.accept().anyerr()?.await.anyerr()?;
 

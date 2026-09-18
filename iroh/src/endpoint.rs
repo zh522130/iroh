@@ -16,7 +16,7 @@ use std::{collections::BTreeSet, net::SocketAddr, pin::Pin, sync::Arc};
 #[cfg(not(wasm_browser))]
 use ipnet::{Ipv4Net, Ipv6Net};
 use iroh_base::{EndpointAddr, EndpointId, RelayUrl, SecretKey, TransportAddr};
-use iroh_relay::{RelayConfig, RelayMap, tls::CaRootsConfig};
+use iroh_relay::{RelayConfig, RelayMap, tls::CaTlsConfig};
 #[cfg(not(wasm_browser))]
 use n0_error::bail;
 use n0_error::{AnyError, e, ensure, stack_error};
@@ -26,12 +26,24 @@ use tokio_util::sync::WaitForCancellationFutureOwned;
 use tracing::{Instrument, Span, debug, event, info_span, instrument, warn};
 use url::Url;
 
-/// Types for defining custom transports
 #[cfg(feature = "unstable-custom-transports")]
 pub mod transports {
-    pub use super::socket::transports::{
-        Addr, AddrKind, RecvInfo, Transmit,
-        custom::{CustomEndpoint, CustomSender, CustomTransport},
+    //! Types for defining custom transports and path selectors.
+    //!
+    //! <div class="warning">
+    //!
+    //! These items are unstable and gated behind the `unstable-custom-transport` feature.
+    //! They are not covered by semantic versioning guarantees and may change in any release
+    //! without a major version bump.
+    //!
+    //! </div>
+
+    pub use super::socket::{
+        remote_map::{PathSelection, PathSelectionContext, PathSelectionData, PathSelector},
+        transports::{
+            Addr, AddrKind, FourTuple, RecvInfo, Transmit,
+            custom::{CustomEndpoint, CustomSender, CustomTransport},
+        },
     };
 }
 
@@ -42,6 +54,7 @@ pub use super::socket::{
         Path, PathEvent, PathEventStream, PathList, PathListIter, PathListStream, RemoteInfo,
         TransportAddrInfo, TransportAddrUsage,
     },
+    transports::LocalTransportAddr,
 };
 #[cfg(wasm_browser)]
 use crate::address_lookup::PkarrResolver;
@@ -49,9 +62,10 @@ use crate::address_lookup::PkarrResolver;
 use crate::dns::DnsResolver;
 #[cfg(feature = "unstable-custom-transports")]
 use crate::endpoint::transports::CustomTransport;
+#[cfg(feature = "unstable-net-report")]
+use crate::net_report::Report as NetReport;
 pub use crate::tls::TlsConfigError;
 use crate::{
-    NetReport,
     address_lookup::{
         AddrFilter, AddressLookupBuilder, AddressLookupFailed, AddressLookupServices,
         DynAddressLookupBuilder, UserData,
@@ -59,8 +73,11 @@ use crate::{
     endpoint::presets::Preset,
     metrics::EndpointMetrics,
     socket::{
-        self, EndpointInner, RemoteStateActorStoppedError, StaticConfig, mapped_addrs::MappedAddr,
-        transports::RelayConnectionState,
+        self, EndpointInner, RemoteStateActorStoppedError, StaticConfig,
+        biased_rtt_path_selector::BiasedRttPathSelector,
+        mapped_addrs::MappedAddr,
+        remote_map::PathSelector,
+        transports::{RelayConnectionFailure, RelayConnectionState},
     },
     tls::{self, DEFAULT_MAX_TLS_TICKETS, misc::RustlsTokenKey},
 };
@@ -81,8 +98,8 @@ pub use self::quic::{QlogConfig, QlogFactory, QlogFileFactory};
 pub use self::{
     connection::{
         Accept, Accepting, AlpnError, AuthenticationError, Connecting, ConnectingError, Connection,
-        ConnectionState, HandshakeCompleted, Incoming, IncomingAddr, IncomingLocalAddr,
-        IncomingZeroRtt, IncomingZeroRttConnection, OutgoingZeroRtt, OutgoingZeroRttConnection,
+        ConnectionState, HandshakeCompleted, Incoming, IncomingAddr, IncomingZeroRtt,
+        IncomingZeroRttConnection, OutgoingZeroRtt, OutgoingZeroRttConnection,
         RemoteEndpointIdError, RetryError, WeakConnectionHandle, ZeroRttStatus,
     },
     quic::{
@@ -99,10 +116,10 @@ pub use self::{
         VarIntBoundsExceeded, WriteError,
     },
 };
-pub use crate::portmapper::PortmapperConfig;
 #[cfg(not(wasm_browser))]
 use crate::socket::transports::IpConfig;
 use crate::socket::transports::TransportConfig;
+pub use crate::{net_report::NetReportConfig, portmapper::PortmapperConfig};
 
 /// Builder for [`Endpoint`].
 ///
@@ -122,14 +139,15 @@ pub struct Builder {
     /// [`Builder::address_lookup`].
     addr_filter: Option<AddrFilter>,
     proxy_url: Option<Url>,
-    ca_roots_config: Option<CaRootsConfig>,
+    ca_tls_config: Option<CaTlsConfig>,
     #[cfg(not(wasm_browser))]
     dns_resolver: Option<DnsResolver>,
     transports: Vec<TransportConfig>,
     max_tls_tickets: usize,
     hooks: EndpointHooksList,
-    transport_bias: socket::transports::TransportBiasMap,
+    path_selector: Arc<dyn PathSelector>,
     portmapper_config: PortmapperConfig,
+    net_report_config: NetReportConfig,
     crypto_provider: Option<Arc<rustls::crypto::CryptoProvider>>,
     configured_addrs: BTreeSet<SocketAddr>,
 }
@@ -189,14 +207,15 @@ impl Builder {
             address_lookup_user_data: Default::default(),
             addr_filter: None,
             proxy_url: None,
-            ca_roots_config: None,
+            ca_tls_config: None,
             #[cfg(not(wasm_browser))]
             dns_resolver: None,
             max_tls_tickets: DEFAULT_MAX_TLS_TICKETS,
             transports,
             hooks: Default::default(),
-            transport_bias: Default::default(),
+            path_selector: Arc::new(BiasedRttPathSelector::default()),
             portmapper_config: Default::default(),
+            net_report_config: Default::default(),
             crypto_provider: None,
             configured_addrs: Default::default(),
         }
@@ -231,19 +250,25 @@ impl Builder {
             tls_config,
             transport_config: self.transport_config.clone(),
             token_key,
+            token_store: Arc::new(noq::TokenMemoryCache::default()),
         };
         let server_config = static_config.create_server_config(self.alpn_protocols);
-
-        #[cfg(not(wasm_browser))]
-        let dns_resolver = self.dns_resolver.unwrap_or_default();
 
         let metrics = EndpointMetrics::default();
 
         let tls_config = self
-            .ca_roots_config
+            .ca_tls_config
             .unwrap_or_default()
             .client_config(crypto_provider)
             .map_err(|err| e!(BindError::InvalidCaRootConfig, err))?;
+
+        #[cfg(not(wasm_browser))]
+        let dns_resolver = self.dns_resolver.unwrap_or_else(|| {
+            DnsResolver::builder()
+                .with_system_defaults()
+                .tls_client_config(tls_config.clone())
+                .build()
+        });
 
         let sock_opts = socket::Options {
             transports: self.transports,
@@ -256,8 +281,9 @@ impl Builder {
             tls_config,
             metrics,
             hooks: self.hooks,
-            transport_bias: self.transport_bias,
+            path_selector: self.path_selector,
             portmapper_config: self.portmapper_config,
+            net_report_config: self.net_report_config,
             static_config,
             configured_addrs: self.configured_addrs,
         };
@@ -391,7 +417,7 @@ impl Builder {
     /// socket should be bound or the routing will be non-deterministic.
     ///
     /// To use a subnet with a non-zero prefix length as the default route in addition to
-    /// being routed when its prefix matches, use [`BindOpts::set_is_default_route].
+    /// being routed when its prefix matches, use [`BindOpts::set_is_default_route`].
     /// Subnets with a prefix length of zero are always marked as default routes.
     ///
     /// Finally note that most outgoing datagrams are part of an existing network flow. That
@@ -592,7 +618,7 @@ impl Builder {
     ///
     /// This filter is applied once, at the [`AddressLookupServices`] level, before
     /// distributing data to any individual address lookup service. This ensures
-    /// consistent filtering regardless of how the services configured.
+    /// consistent filtering regardless of how the services are configured.
     ///
     /// [`AddressLookupServices`]: crate::address_lookup::AddressLookupServices
     pub fn addr_filter(mut self, filter: AddrFilter) -> Self {
@@ -691,9 +717,15 @@ impl Builder {
     /// iroh relays, pkarr servers, or DNS-over-HTTPS resolvers.
     /// They don't need to be trusted for the integrity or authenticity of native
     /// iroh connections, which rely on iroh's own cryptographic authentication mechanisms.
-    pub fn ca_roots_config(mut self, ca_roots_config: CaRootsConfig) -> Self {
-        self.ca_roots_config = Some(ca_roots_config);
+    pub fn ca_tls_config(mut self, ca_tls_config: CaTlsConfig) -> Self {
+        self.ca_tls_config = Some(ca_tls_config);
         self
+    }
+
+    /// Renamed to [`Builder::ca_tls_config`].
+    #[deprecated(since = "1.0.0", note = "Renamed to `ca_tls_config`")]
+    pub fn ca_roots_config(self, ca_roots_config: CaTlsConfig) -> Self {
+        self.ca_tls_config(ca_roots_config)
     }
 
     /// Enables saving the TLS pre-master key for connections.
@@ -729,7 +761,8 @@ impl Builder {
     ///
     /// The two most common crypto providers in use today are `ring` as well as `aws-lc-rs`.
     ///
-    /// If either the `ring` or `aws-lc-rs` feature is set in iroh, this function doesn't need to be called.
+    /// If either the `tls-ring` or `tls-aws-lc-rs` feature is set in iroh, this function doesn't
+    /// need to be called.
     ///
     /// If none of these features are set, then calling this function in the builder is mandatory.
     pub fn crypto_provider(mut self, crypto_provider: Arc<rustls::crypto::CryptoProvider>) -> Self {
@@ -754,28 +787,65 @@ impl Builder {
 
     /// Configures the portmapper service (UPnP, PCP, NAT-PMP).
     ///
-    /// Defaults to [`PortmapperConfig::Enabled`].
+    /// Defaults to [`PortmapperConfig::Enabled`]. Pass
+    /// [`PortmapperConfig::Disabled`] to avoid gateway probing (e.g. if it
+    /// triggers firewall prompts).
     pub fn portmapper_config(mut self, config: PortmapperConfig) -> Self {
         self.portmapper_config = config;
         self
     }
 
-    /// Adds a custom transport
+    /// Configures the net report.
+    ///
+    /// The net report component is responsible for figuring out if and how the endpoint is connected to the internet.
+    /// It does this by doing various probes to the configured relay servers to get public addresses, NAT behaviour, and
+    /// relay latencies. In addition it tries to detect captive portals.
+    ///
+    /// Some non-essential features of the net report component can be disabled via this configuration.
+    pub fn net_report_config(mut self, config: NetReportConfig) -> Self {
+        self.net_report_config = config;
+        self
+    }
+
+    /// Adds a custom transport to the endpoint.
+    ///
+    /// <div class="warning">
+    ///
+    /// This API is unstable and gated behind the `unstable-custom-transport` feature.
+    /// It is not covered by semantic versioning guarantees and may change in any release
+    /// without a major version bump.
+    ///
+    /// </div>
     #[cfg(feature = "unstable-custom-transports")]
     pub fn add_custom_transport(mut self, factory: Arc<dyn CustomTransport>) -> Self {
         self.transports.push(TransportConfig::Custom(factory));
         self
     }
 
-    /// Sets the transport bias for a specific address kind.  Test-only: used by
-    /// in-crate tests to set up deterministic path-selection scenarios.
-    #[cfg(all(test, feature = "unstable-custom-transports"))]
-    pub(crate) fn transport_bias(
-        mut self,
-        kind: socket::transports::AddrKind,
-        bias: socket::transports::TransportBias,
-    ) -> Self {
-        self.transport_bias = self.transport_bias.with_bias(kind, bias);
+    /// Sets a custom [`PathSelector`] for this endpoint.
+    ///
+    /// The path selector decides which path to use among the candidate paths to a
+    /// remote endpoint.  By default iroh uses a built-in selector that sorts paths by
+    /// biased RTT (with IPv6 preferred over IPv4 and relay treated as backup) and is
+    /// sticky to avoid flapping.  Pass a custom [`PathSelector`] here to override that
+    /// policy — for example, to make a custom transport always win over IP.
+    ///
+    /// Takes an `Arc<dyn PathSelector>` so the same selector instance can be shared
+    /// across multiple endpoints if desired.  See `examples/custom-transport.rs` for
+    /// an example implementation.
+    ///
+    /// <div class="warning">
+    ///
+    /// This API is unstable and gated behind the `unstable-custom-transport` feature.
+    /// It is not covered by semantic versioning guarantees and may change in any release
+    /// without a major version bump.
+    ///
+    /// </div>
+    ///
+    /// [`PathSelector`]: socket::remote_map::PathSelector
+    #[cfg(feature = "unstable-custom-transports")]
+    pub fn path_selector(mut self, selector: Arc<dyn PathSelector>) -> Self {
+        self.path_selector = selector;
         self
     }
 }
@@ -807,7 +877,7 @@ pub enum EndpointError {
 /// [`Endpoint::connect`] and [`Endpoint::accept`] methods.  Once established, the
 /// [`Connection`] gives access to most [QUIC] features.  Individual streams to send data to
 /// the peer are created using the [`Connection::open_bi`], [`Connection::accept_bi`],
-/// [`Connection::open_uni`] and [`Connection::open_bi`] functions.
+/// [`Connection::open_uni`] and [`Connection::accept_uni`] functions.
 ///
 /// Note that due to the light-weight properties of streams a stream will only be accepted
 /// once the initiating peer has sent some data on it.
@@ -816,13 +886,22 @@ pub enum EndpointError {
 ///
 /// The endpoint's default [`DnsResolver`] reads the system DNS configuration
 /// through JNI, which needs a JVM context published to [`ndk_context`]. Apps
-/// must initialize that context before constructing the endpoint, or the
-/// resolver build panics. See [`DnsResolver`] for the supported
-/// initialization paths.
+/// should initialize that context before constructing the endpoint. See
+/// [`iroh_dns::install_android_jni_context`] for details (the function is also
+/// exported as `iroh::dns::install_android_jni_context`).
+///
+/// If no JNI context is installed, iroh relies on panic unwinding to detect
+/// the error, and will then use the fallback nameservers instead, subject to the
+/// resolver's [`FallbackMode`]. Note that if your compilation profile sets
+/// `panic = "abort"`, this can't work, and thus your app will panic if using a
+/// default `DnsResolver` without first initializing the JNI context.
 ///
 /// [QUIC]: https://quicwg.org
 /// [`DnsResolver`]: crate::dns::DnsResolver
+/// [`FallbackMode`]: crate::dns::FallbackMode
 /// [`ndk_context`]: https://docs.rs/ndk-context
+/// [`iroh_dns::install_android_jni_context`]: https://docs.rs/iroh-dns/latest/iroh_dns/fn.install_android_jni_context.html
+// The last link can't be a normal doclink, because #[cfg(doc)] can't cross crate boundaries unfortunately.
 #[derive(Clone, Debug)]
 pub struct Endpoint {
     inner: Arc<EndpointInner>,
@@ -851,6 +930,8 @@ pub enum ConnectWithOptsError {
     LocallyRejected,
     #[error("Endpoint is closed")]
     EndpointClosed,
+    #[error("Invalid ALPN")]
+    InvalidAlpn,
 }
 
 #[allow(missing_docs)]
@@ -1039,6 +1120,7 @@ impl Endpoint {
 
         // Connecting to ourselves is not supported.
         ensure!(endpoint_id != self.id(), ConnectWithOptsError::SelfConnect);
+        ensure!(!alpn.is_empty(), ConnectWithOptsError::InvalidAlpn);
 
         event!(
             target: "iroh::_events::conn::connecting",
@@ -1151,8 +1233,8 @@ impl Endpoint {
     /// understand if the endpoint has ever been considered "online". But after
     /// that initial call to [`Endpoint::online`], to understand if your
     /// endpoint is no longer able to be connected to by endpoints outside
-    /// of the private or local network, watch for changes in it's [`EndpointAddr`].
-    /// If there are no `addrs`in the [`EndpointAddr`], you may not be dialable by other endpoints
+    /// of the private or local network, watch for changes in its [`EndpointAddr`].
+    /// If there are no `addrs` in the [`EndpointAddr`], you may not be dialable by other endpoints
     /// on the internet.
     ///
     /// The `EndpointAddr` will change as:
@@ -1245,7 +1327,7 @@ impl Endpoint {
     /// This has no timeout, so if that is needed, you need to wrap it in a
     /// timeout. We recommend using a timeout close to
     /// [`crate::NET_REPORT_TIMEOUT`]s, so you can be sure that at least one
-    /// [`crate::NetReport`] has been attempted.
+    /// net report has been attempted.
     ///
     /// To understand if the endpoint has gone back "offline",
     /// you must use the [`Endpoint::watch_addr`] method, to
@@ -1264,20 +1346,22 @@ impl Endpoint {
     ///
     /// # Examples
     ///
-    /// ```no run
-    /// use iroh::Endpoint;
-    ///
-    /// #[tokio::main]
-    /// async fn main() {
+    /// ```no_run
+    /// # #[cfg(with_crypto_provider)]
+    /// # {
+    /// # #[tokio::main]
+    /// # async fn main() -> n0_error::Result<()> {
+    /// # use iroh::{Endpoint, endpoint::presets};
     /// // After this await returns, the endpoint is bound to a local socket.
     /// // It can be dialed, but almost certainly hasn't finished picking a
     /// // relay.
-    /// let endpoint = Endpoint::bind().await;
+    /// let endpoint = Endpoint::bind(presets::N0).await?;
     ///
     /// // After this await returns we have a connection to at least one relay
     /// // and holepunching should work as expected.
     /// endpoint.online().await;
-    /// }
+    /// # Ok(()) }
+    /// # }
     /// ```
     pub async fn online(&self) {
         let mut watcher = self.inner.home_relay_status();
@@ -1300,9 +1384,14 @@ impl Endpoint {
     ///
     /// The watched value has one entry per home relay whose URL is known,
     /// and is empty when no relays are configured or before the endpoint has
-    /// selected one the home relay from the list of configured relays.
+    /// selected a home relay from the list of configured relays.
     /// The watcher updates whenever any home relay's connection status changes.
     /// See [`RelayStatus`] for the information available on each entry.
+    ///
+    /// This may be used to observe connection failures to the home relay:
+    /// [`RelayStatus::last_error`] reports the most recent error, and
+    /// [`RelayStatus::auth_denied_reason`] singles out the case of the relay
+    /// server denying the endpoint's authentication.
     ///
     /// The returned watcher only becomes disconnected once the last clone of
     /// the [`Endpoint`] is dropped. Closing the endpoint does not disconnect
@@ -1312,21 +1401,29 @@ impl Endpoint {
         self.inner.home_relay_status()
     }
 
-    /// Returns a [`Watcher`] for any net-reports run from this [`Endpoint`].
+    /// Returns a [`Watcher`] for any net report runs from this [`Endpoint`].
     ///
-    /// A `net-report` checks the network conditions of the [`Endpoint`], such as
-    /// whether it is connected to the internet via Ipv4 and/or Ipv6, its NAT
+    /// <div class="warning">
+    ///
+    /// This API is unstable and gated behind the `unstable-net-report` feature.
+    /// It is not covered by semantic versioning guarantees and may change in any release
+    /// without a major version bump.
+    ///
+    /// </div>
+    ///
+    /// A net report checks the network conditions of the [`Endpoint`], such as
+    /// whether it is connected to the internet via IPv4 and/or IPv6, its NAT
     /// status, its latency to the relay servers, and its public addresses.
     ///
-    /// The [`Endpoint`] continuously runs `net-reports` to monitor if network
-    /// conditions have changed. This [`Watcher`] will return the latest result
-    /// of the `net-report`.
+    /// The [`Endpoint`] continuously runs net reports to monitor if network
+    /// conditions have changed. This [`Watcher`] will return the latest
+    /// net report.
     ///
     /// When issuing the first call to this method the first report might
     /// still be underway, in this case the [`Watcher`] might not be initialized
-    /// with [`Some`] value yet.  Once the net-report has been successfully
-    /// run, the [`Watcher`] will always return [`Some`] report immediately, which
-    /// is the most recently run `net-report`.
+    /// with [`Some`] value yet.  Once the net report has been successfully
+    /// run, the [`Watcher`] will always return [`Some`] immediately, which
+    /// is the most recently run net report.
     ///
     /// The returned watcher only becomes disconnected once the last clone of the [`Endpoint`]
     /// is dropped. Closing the endpoint does not disconnect the watcher. Thus, a stream created
@@ -1348,19 +1445,9 @@ impl Endpoint {
     /// # });
     /// # }
     /// ```
-    #[doc(hidden)]
+    #[cfg(feature = "unstable-net-report")]
     pub fn net_report(&self) -> impl Watcher<Value = Option<NetReport>> + use<> {
         self.inner.net_report()
-    }
-
-    /// Returns the last [`NetReport`] generated by this endpoint.
-    ///
-    /// Returns `None` if no net report was ever generated.
-    ///
-    /// This method is hidden in the docs because it is not part of the public api
-    #[doc(hidden)]
-    pub fn last_net_report(&self) -> Option<NetReport> {
-        self.inner.net_report().get()
     }
 
     /// Returns the local socket addresses on which the underlying sockets are bound.
@@ -1404,7 +1491,7 @@ impl Endpoint {
     /// Note that this TLS config is unrelated to how iroh validates the authenticity
     /// of iroh connections itself.
     ///
-    /// The config is based on the trust anchors set via [`Builder::ca_roots_config`].
+    /// The config is based on the trust anchors set via [`Builder::ca_tls_config`].
     pub fn tls_config(&self) -> &rustls::ClientConfig {
         &self.inner.tls_config
     }
@@ -1628,7 +1715,7 @@ impl Endpoint {
     /// kernel during the "Time-Wait" period of the TCP socket.
     ///
     /// Be aware however that the underlying UDP sockets are only closed once all clones of
-    /// the the respective [`Endpoint`] are dropped.
+    /// the respective [`Endpoint`] are dropped.
     pub async fn close(&self) {
         self.inner.close().await;
     }
@@ -1675,15 +1762,12 @@ impl Endpoint {
 
     // # Remaining private methods
 
-    /// Translates a raw [`SocketAddr`] (which may be a synthetic mapped address) into
-    /// a transport address.
-    pub(crate) fn to_transport_addr(&self, addr: SocketAddr) -> crate::socket::transports::Addr {
+    /// Translates a possible IP-mapped [`SocketAddr`] into a transport address.
+    pub(crate) fn to_transport_addr(
+        &self,
+        addr: SocketAddr,
+    ) -> Option<crate::socket::transports::Addr> {
         self.inner.to_transport_addr(addr)
-    }
-
-    /// Reverse-resolves a custom mapped address back to its [`iroh_base::CustomAddr`].
-    pub(crate) fn lookup_custom_addr(&self, addr: SocketAddr) -> Option<iroh_base::CustomAddr> {
-        self.inner.lookup_custom_addr(addr)
     }
 
     #[cfg(all(test, with_crypto_provider))]
@@ -1841,13 +1925,58 @@ impl RelayStatus {
         self.state.is_connected()
     }
 
-    /// Returns the most recent connection error, if the relay is currently
-    /// disconnected.
+    /// Returns the most recent connection error.
     ///
     /// Returns `None` when the relay is connected, or when the endpoint has
     /// not yet observed a failed connection attempt.
+    ///
+    /// The error is meant to be logged or displayed, not matched on: it is an
+    /// [`AnyError`] wrapping a chain of private error types, none of which are
+    /// covered by semver guarantees. Use [`Self::auth_denied_reason`] to
+    /// distinguish the one failure that usually calls for a different reaction
+    /// than retrying.
     pub fn last_error(&self) -> Option<&AnyError> {
-        self.state.last_error().map(Arc::as_ref)
+        self.state.last_failure().map(RelayConnectionFailure::error)
+    }
+
+    /// Returns the reason if the relay server denied our authentication.
+    ///
+    /// Unlike most connection failures, this one will not usually resolve
+    /// itself. The endpoint keeps retrying with a backoff, but it presents the
+    /// same credentials every time, so unless the relay's access policy
+    /// changes it will keep being denied and [`Endpoint::online`] will never
+    /// resolve. An application that configures a relay auth token should
+    /// surface this to the user rather than wait to come online.
+    ///
+    /// The returned string is the reason reported by the relay server. It is
+    /// meant to be human-readable, don't attempt to match on it.
+    ///
+    /// Returns `None` when the relay is connected, when no connection attempt
+    /// has failed yet, or when the last failure had another cause.
+    ///
+    /// ```no_run
+    /// # async fn wrapper() -> n0_error::Result<()> {
+    /// # #[cfg(with_crypto_provider)]
+    /// # {
+    /// use iroh::{Endpoint, Watcher, endpoint::presets};
+    /// use n0_future::StreamExt;
+    ///
+    /// let endpoint = Endpoint::builder(presets::Minimal).bind().await?;
+    /// let mut status = endpoint.home_relay_status().stream();
+    /// while let Some(relays) = status.next().await {
+    ///     for relay in relays {
+    ///         if let Some(reason) = relay.auth_denied_reason() {
+    ///             println!("{}: authentication denied ({reason})", relay.url());
+    ///         }
+    ///     }
+    /// }
+    /// # }
+    /// # Ok(()) }
+    /// ```
+    pub fn auth_denied_reason(&self) -> Option<&str> {
+        self.state
+            .last_failure()
+            .and_then(RelayConnectionFailure::auth_denied_reason)
     }
 }
 
@@ -1886,8 +2015,8 @@ impl RelayMode {
     /// # fn main() -> n0_error::Result<()> {
     /// # use iroh::RelayMode;
     /// RelayMode::custom([
-    ///     "https://use1-1.relay.n0.iroh-canary.iroh.link.".parse()?,
-    ///     "https://euw-1.relay.n0.iroh-canary.iroh.link.".parse()?,
+    ///     "https://use1-1.relay.n0.iroh.link.".parse()?,
+    ///     "https://euw-1.relay.n0.iroh.link.".parse()?,
     /// ]);
     /// # Ok(()) }
     /// ```
@@ -1936,13 +2065,10 @@ mod tests {
         time::{Duration, Instant},
     };
 
+    use assert_matches::assert_matches;
     use iroh_base::{EndpointAddr, EndpointId, RelayUrl, SecretKey, TransportAddr};
     use iroh_dns::endpoint_info::UserData;
-    use iroh_relay::{
-        RelayConfig,
-        server::{Access, AccessConfig},
-        tls::CaRootsConfig,
-    };
+    use iroh_relay::{RelayConfig, RelayQuicConfig, server::Access, tls::CaTlsConfig};
     use n0_error::{AnyError as Error, Result, StdResultExt};
     use n0_future::{BufferedStreamExt, StreamExt, future::now_or_never, stream, time};
     use n0_tracing_test::traced_test;
@@ -1988,6 +2114,31 @@ mod tests {
 
     #[tokio::test]
     #[traced_test]
+    async fn test_connect_empty_alpn() -> Result {
+        let server = Endpoint::builder(presets::Minimal)
+            .alpns(vec![TEST_ALPN.to_vec()])
+            .bind()
+            .await
+            .unwrap();
+        let server_addr = server.addr();
+
+        let client = Endpoint::builder(presets::Minimal).bind().await.unwrap();
+        let res = client.connect(server_addr, b"").await;
+        assert!(res.is_err());
+        let err = res.err().unwrap();
+        assert_matches!(
+            err,
+            ConnectError::Connect {
+                source: ConnectWithOptsError::InvalidAlpn { .. },
+                ..
+            }
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[traced_test]
     async fn endpoint_connect_close() -> Result {
         let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(0u64);
         let (relay_map, relay_url, _guard) = run_relay_server().await?;
@@ -2002,7 +2153,7 @@ mod tests {
             .secret_key(server_secret_key)
             .transport_config(qlog.create("server")?)
             .alpns(vec![TEST_ALPN.to_vec()])
-            .ca_roots_config(CaRootsConfig::insecure_skip_verify())
+            .ca_tls_config(CaTlsConfig::insecure_skip_verify())
             .bind()
             .await?;
         // Wait for the endpoint to be reachable via relay
@@ -2043,7 +2194,7 @@ mod tests {
                 let ep = Endpoint::builder(presets::Minimal)
                     .relay_mode(RelayMode::Custom(relay_map))
                     .alpns(vec![TEST_ALPN.to_vec()])
-                    .ca_roots_config(CaRootsConfig::insecure_skip_verify())
+                    .ca_tls_config(CaTlsConfig::insecure_skip_verify())
                     .transport_config(qlog.create("client")?)
                     .bind()
                     .await?;
@@ -2104,7 +2255,7 @@ mod tests {
         // Make sure the server is bound before having clients connect to it:
         let ep = Endpoint::builder(presets::Minimal)
             .relay_mode(RelayMode::Custom(relay_map.clone()))
-            .ca_roots_config(CaRootsConfig::insecure_skip_verify())
+            .ca_tls_config(CaTlsConfig::insecure_skip_verify())
             .secret_key(server_secret_key)
             .alpns(vec![TEST_ALPN.to_vec()])
             .bind()
@@ -2170,7 +2321,7 @@ mod tests {
                 let ep = Endpoint::builder(presets::Minimal)
                     .relay_mode(RelayMode::Custom(relay_map.clone()))
                     .alpns(vec![TEST_ALPN.to_vec()])
-                    .ca_roots_config(CaRootsConfig::insecure_skip_verify())
+                    .ca_tls_config(CaTlsConfig::insecure_skip_verify())
                     .secret_key(client_secret_key)
                     .bind()
                     .await?;
@@ -2223,12 +2374,12 @@ mod tests {
         let (relay_map, _relay_url, _guard) = run_relay_server().await?;
         let client = Endpoint::builder(presets::Minimal)
             .relay_mode(RelayMode::Custom(relay_map.clone()))
-            .ca_roots_config(CaRootsConfig::insecure_skip_verify())
+            .ca_tls_config(CaTlsConfig::insecure_skip_verify())
             .bind()
             .await?;
         let server = Endpoint::builder(presets::Minimal)
             .relay_mode(RelayMode::Custom(relay_map))
-            .ca_roots_config(CaRootsConfig::insecure_skip_verify())
+            .ca_tls_config(CaTlsConfig::insecure_skip_verify())
             .alpns(vec![TEST_ALPN.to_vec()])
             .bind()
             .await?;
@@ -2349,7 +2500,7 @@ mod tests {
             let ep = Endpoint::builder(presets::N0)
                 .secret_key(secret)
                 .alpns(vec![TEST_ALPN.to_vec()])
-                .ca_roots_config(CaRootsConfig::insecure_skip_verify())
+                .ca_tls_config(CaTlsConfig::insecure_skip_verify())
                 .relay_mode(RelayMode::Custom(relay_map))
                 .transport_config(qlog.create("client")?)
                 .bind()
@@ -2396,7 +2547,7 @@ mod tests {
             let ep = Endpoint::builder(presets::N0)
                 .secret_key(secret)
                 .alpns(vec![TEST_ALPN.to_vec()])
-                .ca_roots_config(CaRootsConfig::insecure_skip_verify())
+                .ca_tls_config(CaTlsConfig::insecure_skip_verify())
                 .transport_config(qlog.create("server")?)
                 .relay_mode(RelayMode::Custom(relay_map))
                 .bind()
@@ -2454,7 +2605,7 @@ mod tests {
             let ep = Endpoint::builder(presets::N0)
                 .secret_key(secret)
                 .alpns(vec![TEST_ALPN.to_vec()])
-                .ca_roots_config(CaRootsConfig::insecure_skip_verify())
+                .ca_tls_config(CaTlsConfig::insecure_skip_verify())
                 .relay_mode(RelayMode::Custom(relay_map))
                 .clear_ip_transports() // disable direct
                 .bind()
@@ -2498,7 +2649,7 @@ mod tests {
             let ep = Endpoint::builder(presets::N0)
                 .secret_key(secret)
                 .alpns(vec![TEST_ALPN.to_vec()])
-                .ca_roots_config(CaRootsConfig::insecure_skip_verify())
+                .ca_tls_config(CaTlsConfig::insecure_skip_verify())
                 .relay_mode(RelayMode::Custom(relay_map))
                 .clear_ip_transports()
                 .bind()
@@ -2554,7 +2705,7 @@ mod tests {
             let ep = Endpoint::builder(presets::N0)
                 .secret_key(secret)
                 .alpns(vec![TEST_ALPN.to_vec()])
-                .ca_roots_config(CaRootsConfig::insecure_skip_verify())
+                .ca_tls_config(CaTlsConfig::insecure_skip_verify())
                 .relay_mode(RelayMode::Custom(relay_map))
                 .bind()
                 .await?;
@@ -2604,7 +2755,7 @@ mod tests {
             let ep = Endpoint::builder(presets::N0)
                 .secret_key(secret)
                 .alpns(vec![TEST_ALPN.to_vec()])
-                .ca_roots_config(CaRootsConfig::insecure_skip_verify())
+                .ca_tls_config(CaTlsConfig::insecure_skip_verify())
                 .relay_mode(RelayMode::Custom(relay_map))
                 .bind()
                 .await?;
@@ -2659,12 +2810,12 @@ mod tests {
         let (relay_map, relay_url, _guard1) = run_relay_server().await?;
         let client = Endpoint::builder(presets::Minimal)
             .relay_mode(RelayMode::Custom(relay_map.clone()))
-            .ca_roots_config(CaRootsConfig::insecure_skip_verify())
+            .ca_tls_config(CaTlsConfig::insecure_skip_verify())
             .bind()
             .await?;
         let server = Endpoint::builder(presets::Minimal)
             .relay_mode(RelayMode::Custom(relay_map))
-            .ca_roots_config(CaRootsConfig::insecure_skip_verify())
+            .ca_tls_config(CaTlsConfig::insecure_skip_verify())
             .alpns(vec![TEST_ALPN.to_vec()])
             .bind()
             .await?;
@@ -2862,6 +3013,81 @@ mod tests {
         Ok(())
     }
 
+    /// Regression test: Don't fail connections with dead relays on Windows.
+    ///
+    /// A single client connecting to a single server over a usable direct path
+    /// must succeed even when both are configured with an unreachable home relay
+    /// (`https://127.0.0.1:1`, nothing listening). The dead relay should be irrelevant:
+    /// the direct path works and the connection comes up in milliseconds.
+    ///
+    /// This was broken on Windows because QaD sends over the same socket to the dead
+    /// relay, and the socket would return recv errors on the next recv to report ICMP
+    /// errors for the previous send. We now skip over these errors, implemented in
+    /// https://github.com/n0-computer/net-tools/pull/166, so this no longer fails.
+    #[tokio::test]
+    async fn endpoint_unreachable_relay_direct_connect_succeeds() -> Result {
+        // The relay url and its QADv4 probe must both hit closed ports, so the relay is
+        // unreachable and the probe draws the ICMP port-unreachable the Windows socket
+        // reports on its next recv. Claim an ephemeral port, then close it: it's now free,
+        // so nothing answers. There's nothing stopping the kernel from reusing a port
+        // right away, but on most machines that's unlikely. The url is dialed over TCP
+        // (HTTPS), the probe over UDP, so claim each with the matching socket type.
+        let closed_tcp_port = {
+            let sock = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind");
+            sock.local_addr().expect("local addr").port()
+        };
+        let closed_udp_port = {
+            let sock = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind");
+            sock.local_addr().expect("local addr").port()
+        };
+        let dead_relay: RelayUrl = format!("https://127.0.0.1:{closed_tcp_port}")
+            .parse()
+            .expect("valid relay url");
+        let dead_relay_config = RelayConfig::new(
+            dead_relay.clone(),
+            Some(RelayQuicConfig::new(closed_udp_port)),
+        );
+
+        let bind_endpoint = async || {
+            Endpoint::builder(presets::Minimal)
+                // Use the broken relay to trigger the ICMP errors from the QaD sends.
+                .relay_mode(RelayMode::Custom(RelayMap::from_iter([
+                    dead_relay_config.clone()
+                ])))
+                .ca_tls_config(CaTlsConfig::insecure_skip_verify())
+                .alpns(vec![TEST_ALPN.to_vec()])
+                // Bind on IPv4 only to ensure a single socket to not have spurious polls.
+                .bind_addr((Ipv4Addr::LOCALHOST, 0))
+                .expect("valid addr")
+                .bind()
+                .await
+        };
+
+        let server = bind_endpoint().await?;
+        let server_addr = server.addr().with_relay_url(dead_relay.clone());
+        let client = bind_endpoint().await?;
+
+        // Server accepts the incoming connection and holds it open until the test ends.
+        let accept = tokio::spawn(async move {
+            let incoming = server.accept().await.anyerr()?;
+            let conn = incoming.await.anyerr()?;
+            conn.closed().await;
+            server.close().await;
+            n0_error::Ok(())
+        });
+
+        // The connect must complete over the direct loopback path despite the dead relay.
+        let _conn = tokio::time::timeout(
+            Duration::from_secs(10),
+            client.connect(server_addr, TEST_ALPN),
+        )
+        .await
+        .expect("connection should succeed")?;
+        client.close().await;
+        accept.await.anyerr()??;
+        Ok(())
+    }
+
     #[tokio::test]
     #[traced_test]
     async fn test_direct_addresses_no_qad_relay() -> Result {
@@ -2870,7 +3096,7 @@ mod tests {
         let ep = Endpoint::builder(presets::Minimal)
             .relay_mode(RelayMode::Custom(relay_map))
             .alpns(vec![TEST_ALPN.to_vec()])
-            .ca_roots_config(CaRootsConfig::insecure_skip_verify())
+            .ca_tls_config(CaTlsConfig::insecure_skip_verify())
             .bind()
             .await?;
 
@@ -2928,7 +3154,6 @@ mod tests {
         Ok(())
     }
 
-    #[cfg_attr(target_os = "windows", ignore = "flaky")]
     #[tokio::test]
     #[traced_test]
     async fn graceful_close() -> Result {
@@ -3126,6 +3351,7 @@ mod tests {
 
     #[tokio::test]
     #[traced_test]
+    #[cfg(feature = "unstable-net-report")]
     async fn watch_net_report() -> Result {
         let endpoint = Endpoint::builder(presets::Minimal)
             .relay_mode(RelayMode::Staging)
@@ -3212,14 +3438,14 @@ mod tests {
     async fn test_custom_relay() -> Result {
         let _ep = Endpoint::builder(presets::Minimal)
             .relay_mode(RelayMode::custom([RelayUrl::from_str(
-                "https://use1-1.relay.n0.iroh-canary.iroh.link.",
+                "https://use1-1.relay.n0.iroh.link.",
             )?]))
             .bind()
             .await?;
 
         let relays = RelayMap::try_from_iter([
-            "https://use1-1.relay.n0.iroh.iroh.link/",
-            "https://euc1-1.relay.n0.iroh.iroh.link/",
+            "https://use1-1.relay.n0.iroh.link/",
+            "https://euc1-1.relay.n0.iroh.link/",
         ])?;
         let _ep = Endpoint::builder(presets::Minimal)
             .relay_mode(RelayMode::Custom(relays))
@@ -3491,7 +3717,7 @@ mod tests {
                 if let PathEvent::Closed {
                     remote_addr,
                     last_stats,
-                    id: _,
+                    ..
                 } = event
                 {
                     stats.insert(remote_addr, *last_stats);
@@ -3502,13 +3728,13 @@ mod tests {
 
         let client = Endpoint::builder(presets::Minimal)
             .relay_mode(RelayMode::Custom(relay_map.clone()))
-            .ca_roots_config(CaRootsConfig::insecure_skip_verify())
+            .ca_tls_config(CaTlsConfig::insecure_skip_verify())
             .transport_config(qlog.create("client")?)
             .bind()
             .await?;
         let server = Endpoint::builder(presets::Minimal)
             .relay_mode(RelayMode::Custom(relay_map))
-            .ca_roots_config(CaRootsConfig::insecure_skip_verify())
+            .ca_tls_config(CaTlsConfig::insecure_skip_verify())
             .transport_config(qlog.create("server")?)
             .alpns(vec![TEST_ALPN.to_vec()])
             .bind()
@@ -3586,7 +3812,7 @@ mod tests {
 
         let client = Endpoint::builder(presets::Minimal)
             .relay_mode(RelayMode::Custom(relay_map.clone()))
-            .ca_roots_config(CaRootsConfig::insecure_skip_verify())
+            .ca_tls_config(CaTlsConfig::insecure_skip_verify())
             .bind()
             .instrument(error_span!("ep-client"))
             .await?;
@@ -3597,7 +3823,7 @@ mod tests {
         let ep1 = Endpoint::builder(presets::Minimal)
             .relay_mode(RelayMode::Custom(relay_map.clone()))
             .secret_key(secret_key.clone())
-            .ca_roots_config(CaRootsConfig::insecure_skip_verify())
+            .ca_tls_config(CaTlsConfig::insecure_skip_verify())
             .alpns(vec![TEST_ALPN.to_vec()])
             .bind()
             .instrument(error_span!("ep1"))
@@ -3627,7 +3853,7 @@ mod tests {
         let ep2 = Endpoint::builder(presets::Minimal)
             .relay_mode(RelayMode::Custom(relay_map))
             .secret_key(secret_key.clone())
-            .ca_roots_config(CaRootsConfig::insecure_skip_verify())
+            .ca_tls_config(CaTlsConfig::insecure_skip_verify())
             .alpns(vec![TEST_ALPN.to_vec()])
             .bind()
             .instrument(error_span!("ep2"))
@@ -3758,11 +3984,16 @@ mod tests {
 
         // create watchers to verify they terminate after the endpoint is dropped.
         let mut addrs = ep.watch_addr().stream();
-        let mut net_reports = ep.net_report().stream();
 
-        // returns None
-        let net_report = ep.last_net_report();
-        info!("last Net report {net_report:?}");
+        #[cfg(feature = "unstable-net-report")]
+        let mut net_reports = {
+            let net_reports = ep.net_report().stream();
+
+            // returns None
+            let net_report = ep.net_report().get();
+            info!("last Net report {net_report:?}");
+            net_reports
+        };
 
         // this should work
         let sockets = ep.bound_sockets();
@@ -3795,6 +4026,8 @@ mod tests {
             while let Some(addr) = addrs.next().await {
                 info!("Addrs stream: {addr:?}");
             }
+
+            #[cfg(feature = "unstable-net-report")]
             while let Some(net_report) = net_reports.next().await {
                 info!("Net report stream: {net_report:?}");
             }
@@ -3864,7 +4097,7 @@ mod tests {
     async fn test_endpoint_online_add_relay() -> Result {
         let ep = Endpoint::builder(presets::Minimal)
             .relay_mode(RelayMode::Custom(RelayMap::empty()))
-            .ca_roots_config(CaRootsConfig::insecure_skip_verify())
+            .ca_tls_config(CaTlsConfig::insecure_skip_verify())
             .bind()
             .await?;
         // should not come online without relays.
@@ -3909,39 +4142,54 @@ mod tests {
     }
 
     /// Verifies that an endpoint configured with [`RelayConfig::with_auth_token`]
-    /// is admitted to a relay that uses [`AccessConfig::Restricted`] only when
+    /// is admitted to a relay whose access control checks the token only when
     /// the token matches.
+    ///
+    /// Also verifies that [`RelayStatus::auth_denied_reason`] works correctly.
     #[tokio::test]
     #[traced_test]
     async fn test_endpoint_relay_auth_token() -> Result {
         const TOKEN: &str = "valid-token";
+        const DENIAL_REASON: &str = "this token is no good";
 
-        let access = AccessConfig::Restricted(Box::new(|request| {
-            Box::pin(async move {
-                if request.auth_token().as_deref() == Some(TOKEN) {
+        /// Admits a connection only if it carries the expected auth token.
+        #[derive(Debug)]
+        struct TokenAccess(&'static str);
+
+        impl iroh_relay::server::AccessControl for TokenAccess {
+            async fn on_connect(&self, request: &iroh_relay::server::ClientRequest) -> Access {
+                if request.auth_token().as_deref() == Some(self.0) {
                     Access::Allow
                 } else {
-                    Access::Deny
+                    Access::Deny {
+                        reason: Some(DENIAL_REASON.to_string()),
+                    }
                 }
-            })
-        }));
+            }
+        }
+
+        let access = Arc::new(TokenAccess(TOKEN));
         let (_relay_map, relay_url, _guard) = run_relay_server_with_access(false, access).await?;
 
-        // Wrong token: the connection attempt fails and last_error reports
-        // the relay-side denial.
+        // Wrong token: the connection attempt fails, and the status reports the
+        // relay-side denial both as an error and as an authentication failure.
         let bad_map: RelayMap = RelayConfig::new(relay_url.clone(), None)
             .with_auth_token("wrong-token")
             .into();
         let bad_ep = Endpoint::builder(presets::Minimal)
             .relay_mode(RelayMode::Custom(bad_map))
-            .ca_roots_config(CaRootsConfig::insecure_skip_verify())
+            .ca_tls_config(CaTlsConfig::insecure_skip_verify())
             .bind()
             .await?;
         let mut stream = bad_ep.home_relay_status().stream();
-        let auth_err: String = tokio::time::timeout(Duration::from_secs(5), async {
+        let (auth_err, auth_denied_reason) = tokio::time::timeout(Duration::from_secs(5), async {
             while let Some(status) = stream.next().await {
-                if let Some(err) = status.iter().filter_map(|s| s.last_error()).next() {
-                    return format!("{err:#}");
+                if let Some(relay) = status.iter().find(|s| s.last_error().is_some()) {
+                    let err = relay.last_error().expect("checked above");
+                    return (
+                        format!("{err:#}"),
+                        relay.auth_denied_reason().map(ToOwned::to_owned),
+                    );
                 }
             }
             panic!("home relay stream ended");
@@ -3949,8 +4197,13 @@ mod tests {
         .await
         .std_context("waiting for auth error")?;
         assert!(
-            auth_err.contains("not authorized"),
-            "expected 'not authorized' in error, got: {auth_err}"
+            auth_err.contains(DENIAL_REASON),
+            "expected {DENIAL_REASON:?} in error, got: {auth_err}"
+        );
+        assert_eq!(
+            auth_denied_reason.as_deref(),
+            Some(DENIAL_REASON),
+            "auth_denied_reason did not recognise a relay-side denial (error was: {auth_err})"
         );
 
         // Correct token: the endpoint reaches the connected state.
@@ -3959,7 +4212,7 @@ mod tests {
             .into();
         let good_ep = Endpoint::builder(presets::Minimal)
             .relay_mode(RelayMode::Custom(good_map))
-            .ca_roots_config(CaRootsConfig::insecure_skip_verify())
+            .ca_tls_config(CaTlsConfig::insecure_skip_verify())
             .bind()
             .await?;
         tokio::time::timeout(Duration::from_secs(5), good_ep.online())

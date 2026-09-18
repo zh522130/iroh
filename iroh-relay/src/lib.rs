@@ -33,33 +33,31 @@
 pub mod client;
 pub mod defaults;
 pub mod http;
+mod key_cache;
+mod ping_tracker;
 pub mod protos;
 pub mod quic;
+mod relay_map;
 #[cfg(feature = "server")]
 pub mod server;
+#[cfg(test)]
+pub(crate) mod test_utils;
 pub mod tls;
 
-mod ping_tracker;
-
-mod key_cache;
-mod relay_map;
-pub use key_cache::KeyCache;
-pub use protos::relay::MAX_PACKET_SIZE;
-
 pub use crate::{
+    key_cache::KeyCache,
     ping_tracker::PingTracker,
+    protos::relay::MAX_PACKET_SIZE,
     relay_map::{RelayConfig, RelayMap, RelayQuicConfig},
 };
 
-/// This trait allows anything that ends up potentially
-/// wrapping a TLS stream use the underlying [`export_keying_material`]
-/// function.
-///
-/// [`export_keying_material`]: rustls::ConnectionCommon::export_keying_material
 /// Trait for extracting keying material from a TLS connection.
 ///
-/// This is used during the relay handshake to establish a shared secret
-/// between the client and server for authentication purposes.
+/// This allows anything that ends up potentially wrapping a TLS stream to use the
+/// underlying [`export_keying_material`] function. It is used during the relay handshake
+/// to establish a shared secret between the client and server for authentication purposes.
+///
+/// [`export_keying_material`]: rustls::ConnectionCommon::export_keying_material
 pub trait ExportKeyingMaterial {
     /// If this type ends up wrapping a TLS stream, then this tries
     /// to export keying material by calling the underlying [`export_keying_material`]

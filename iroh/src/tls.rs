@@ -1,6 +1,6 @@
 //! TLS configuration for iroh.
 //!
-//! Currently there is one mechanisms available
+//! Currently there is one mechanism available:
 //! - Raw Public Keys, using the TLS extension described in [RFC 7250]
 //!
 //! [RFC 7250]: https://datatracker.ietf.org/doc/html/rfc7250
@@ -18,7 +18,9 @@ pub(crate) mod name;
 mod resolver;
 mod verifier;
 
+#[allow(deprecated)] // Re-export of backwards-compatibility item
 pub use iroh_relay::tls::CaRootsConfig;
+pub use iroh_relay::tls::CaTlsConfig;
 #[cfg(with_crypto_provider)]
 pub use iroh_relay::tls::default_provider;
 
@@ -85,6 +87,11 @@ impl TlsConfig {
         // TODO: enable/disable 0-RTT/storing tickets
         crypto.resumption = rustls::client::Resumption::store(self.session_store.clone());
         crypto.enable_early_data = true;
+
+        // The synthetic server name is used locally to select the expected endpoint ID
+        // and to partition the session cache. Iroh servers do not use SNI, so do not
+        // disclose the endpoint ID in the ClientHello.
+        crypto.enable_sni = false;
 
         if keylog {
             warn!("enabling SSLKEYLOGFILE for TLS pre-master keys");

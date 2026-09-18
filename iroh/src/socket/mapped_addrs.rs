@@ -12,7 +12,7 @@ use std::{
 };
 
 use n0_error::{e, stack_error};
-use portable_atomic::{AtomicU64, Ordering};
+use rand::Rng;
 use rustc_hash::FxHashMap;
 use tracing::trace;
 
@@ -54,20 +54,14 @@ pub(crate) const DEFAULT_FAKE_ADDR: SocketAddrV6 = SocketAddrV6::new(
 /// involve ports, so we use a dummy fixed port when creating socket addresses.
 const MAPPED_PORT: u16 = 12345;
 
-/// Counter to always generate unique addresses for [`RelayMappedAddr`].
-static RELAY_ADDR_COUNTER: AtomicU64 = AtomicU64::new(1);
-
-/// Counter to always generate unique addresses for [`EndpointIdMappedAddr`].
-static ENDPOINT_ID_ADDR_COUNTER: AtomicU64 = AtomicU64::new(1);
-
-/// Counter to always generate unique addresses for [`CustomMappedAddr`].
-static CUSTOM_ADDR_COUNTER: AtomicU64 = AtomicU64::new(1);
-
 /// Generic mapped address.
 ///
 /// Allows implementing [`AddrMap`].
 pub(crate) trait MappedAddr {
     /// Generates a new mapped address in the IPv6 Unique Local Address space.
+    ///
+    /// The host bits are random so a remote peer cannot guess one of our live mapped
+    /// addresses (uniqueness is ensured by [`AddrMap::get`]).
     fn generate() -> Self;
 
     /// Returns a consistent [`SocketAddr`] for the mapped addr.
@@ -144,9 +138,7 @@ impl MappedAddr for EndpointIdMappedAddr {
         addr[0] = ADDR_PREFIXL;
         addr[1..6].copy_from_slice(&ADDR_GLOBAL_ID);
         addr[6..8].copy_from_slice(&ENDPOINT_ID_SUBNET);
-
-        let counter = ENDPOINT_ID_ADDR_COUNTER.fetch_add(1, Ordering::Relaxed);
-        addr[8..16].copy_from_slice(&counter.to_be_bytes());
+        rand::rng().fill_bytes(&mut addr[8..16]);
 
         Self(Ipv6Addr::from(addr))
     }
@@ -207,9 +199,7 @@ impl MappedAddr for RelayMappedAddr {
         addr[0] = ADDR_PREFIXL;
         addr[1..6].copy_from_slice(&ADDR_GLOBAL_ID);
         addr[6..8].copy_from_slice(&RELAY_MAPPED_SUBNET);
-
-        let counter = RELAY_ADDR_COUNTER.fetch_add(1, Ordering::Relaxed);
-        addr[8..16].copy_from_slice(&counter.to_be_bytes());
+        rand::rng().fill_bytes(&mut addr[8..16]);
 
         Self(Ipv6Addr::from(addr))
     }
@@ -269,9 +259,7 @@ impl MappedAddr for CustomMappedAddr {
         addr[0] = ADDR_PREFIXL;
         addr[1..6].copy_from_slice(&ADDR_GLOBAL_ID);
         addr[6..8].copy_from_slice(&CUSTOM_MAPPED_SUBNET);
-
-        let counter = CUSTOM_ADDR_COUNTER.fetch_add(1, Ordering::Relaxed);
-        addr[8..16].copy_from_slice(&counter.to_be_bytes());
+        rand::rng().fill_bytes(&mut addr[8..16]);
 
         Self(Ipv6Addr::from(addr))
     }
@@ -284,6 +272,17 @@ impl MappedAddr for CustomMappedAddr {
     /// addressing.  This socket address is only to be used to pass into Noq.
     fn private_socket_addr(&self) -> SocketAddr {
         SocketAddr::new(IpAddr::from(self.0), MAPPED_PORT)
+    }
+}
+
+impl TryFrom<IpAddr> for CustomMappedAddr {
+    type Error = CustomMappedAddrError;
+
+    fn try_from(value: IpAddr) -> std::result::Result<Self, Self::Error> {
+        match value {
+            IpAddr::V4(_) => Err(e!(CustomMappedAddrError)),
+            IpAddr::V6(addr) => addr.try_into(),
+        }
     }
 }
 
@@ -339,7 +338,12 @@ where
         match inner.addrs.get(key) {
             Some(addr) => *addr,
             None => {
-                let addr = V::generate();
+                let addr = loop {
+                    let candidate = V::generate();
+                    if !inner.lookup.contains_key(&candidate) {
+                        break candidate;
+                    }
+                };
                 inner.addrs.insert(key.clone(), addr);
                 inner.lookup.insert(addr, key.clone());
                 trace!(?addr, ?key, "generated new addr");

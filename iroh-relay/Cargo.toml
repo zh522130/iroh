@@ -1,6 +1,6 @@
 [package]
 name = "iroh-relay"
-version = "1.0.0-rc.0"
+version = "1.2.0"
 edition = "2024"
 readme = "README.md"
 description = "Iroh's relay server and client"
@@ -33,11 +33,11 @@ http = "1"
 http-body-util = "0.1.0"
 hyper = { version = "1", features = ["server", "client", "http1"] }
 hyper-util = "0.1.1"
-iroh-base = { version = "1.0.0-rc.0", path = "../iroh-base", default-features = false, features = ["key", "relay"] }
-iroh-dns = { version = "1.0.0-rc.0", path = "../iroh-dns" }
-iroh-metrics = { version = "=1.0.0-rc.0", default-features = false }
+iroh-base = { version = "1.2.0", path = "../iroh-base", default-features = false, features = ["key", "relay"] }
+iroh-dns = { version = "1.3.0", path = "../iroh-dns" }
+iroh-metrics = { version = "1.0.1", default-features = false }
 lru = "0.18.0"
-n0-error = "=1.0.0-rc.0"
+n0-error = "1.0.0"
 n0-future = "0.3"
 num_enum = "0.7"
 pin-project = "1"
@@ -46,8 +46,8 @@ postcard = { version = "1", default-features = false, features = [
     "use-std",
     "experimental-derive",
 ] }
-noq = { version = "=1.0.0-rc.0", default-features = false, features = ["rustls"] }
-noq-proto = { version = "=1.0.0-rc.0", default-features = false }
+noq = { version = "1.3.0", default-features = false, features = ["rustls"] }
+noq-proto = { version = "1.3.0", default-features = false }
 rand = "0.10"
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
 rustls = { version = "0.23.33", default-features = false }
@@ -71,7 +71,6 @@ webpki_types = { package = "rustls-pki-types", version = "1.12" }
 # server feature
 clap = { version = "4", features = ["derive"], optional = true }
 dashmap = { version = "6.1.0", optional = true }
-ahash = { version = "0.8.11", optional = true } # minimal version fix
 rcgen = { version = "0.14", optional = true }
 reloadable-state = { version = "0.1", optional = true }
 rustls-cert-reloadable-resolver = { version = "0.7.1", optional = true }
@@ -87,7 +86,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = tr
 
 # non-wasm-in-browser dependencies
 [target.'cfg(not(all(target_family = "wasm", target_os = "unknown")))'.dependencies]
-hickory-resolver = { version = "0.26.0", features = ["tokio", "system-config"] }
 tokio = { version = "1", features = [
     "io-util",
     "macros",
@@ -108,6 +106,7 @@ getrandom = { version = "0.4", features = ["wasm_js"] }
 clap = { version = "4", features = ["derive"] }
 proptest = "1.11.0"
 rand_chacha = "0.10"
+test-strategy = "0.4.5"
 tokio = { version = "1", features = [
     "io-util",
     "sync",
@@ -125,8 +124,7 @@ n0-tracing-test = "0.3"
 axum = { version = "0.8", features = ["ws"] }
 
 [build-dependencies]
-cfg_aliases = "0.2.1"
-vergen-gitcl = "9.1"
+cfg_aliases = "0.2.2"
 
 [features]
 default = ["metrics", "tls-ring"]
@@ -135,9 +133,9 @@ platform-verifier = ["dep:rustls-platform-verifier"]
 server = [
     "metrics",
     "tokio/signal",
+    "tokio/rt-multi-thread",
     "dep:clap",
     "dep:dashmap",
-    "dep:ahash",
     "dep:rcgen",
     "dep:reloadable-state",
     "dep:rustls-cert-file-reader",
@@ -162,7 +160,6 @@ tls-ring = [
     "rustls/ring",
     "tokio-rustls/ring",
     "tokio-websockets/ring",
-    "hickory-resolver/https-ring",
     "iroh-dns/tls-ring",
 ]
 tls-aws-lc-rs = [
@@ -170,7 +167,6 @@ tls-aws-lc-rs = [
     "rustls/aws-lc-rs",
     "tokio-rustls/aws-lc-rs",
     "tokio-websockets/aws_lc_rs",
-    "hickory-resolver/https-aws-lc-rs",
     "iroh-dns/tls-aws-lc-rs",
 ]
 
@@ -182,3 +178,29 @@ required-features = ["server"]
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "iroh_docsrs"]
+
+[package.metadata.cargo_check_external_types]
+allowed_external_types = [
+    # workspace crates
+    "iroh_base::*",
+    "iroh_dns::*",
+    # crates owned by us that will move to 1.0 as well
+    "iroh_metrics::*",
+    "n0_error::*",
+    "noq::*",
+    "noq_proto::*",
+    # 1.0 crates that we deem fine to be part of the public API
+    "bytes::*",
+    "http::*",
+    "http_body::*",
+    "hyper::*",
+    "rustls_pki_types::*",
+    "serde_core::*",
+    "tokio::*",
+    "url::*",
+    # non-1.0 crates that we decided to accept in the public API
+    "rustls::*",
+    "tokio_rustls::*",
+    "futures_core::stream::Stream",
+    "futures_sink::Sink",
+]

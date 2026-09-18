@@ -3,19 +3,25 @@ use std::{future::Future, path::PathBuf, sync::Arc, time::Duration};
 use iroh::{
     Endpoint, EndpointAddr, RelayMap, RelayMode, TransportAddr,
     endpoint::{Connection, Path, PathEvent, presets},
-    tls::CaRootsConfig,
+    tls::CaTlsConfig,
 };
 use iroh_metrics::MetricsGroupSet;
 use n0_error::{Result, StackResultExt, StdResultExt, anyerr, ensure_any};
 use n0_future::{StreamExt, boxed::BoxFuture, task::AbortOnDropHandle};
 use noq::Side;
-use patchbay::{Device, IpSupport, Lab, OutDir, TestGuard};
+use patchbay::{Device, IpSupport, Lab, TestGuard};
 use tokio::sync::{Barrier, oneshot};
 use tracing::{Instrument, debug, error, error_span, event, info};
 
 use self::relay::run_relay_server;
 
 const TEST_ALPN: &[u8] = b"test";
+
+/// Upper bound on waiting for the peer task at the end-of-run barrier in [`Pair::run`].
+///
+/// Generous compared to the run functions' own timeouts; it only triggers when the
+/// peer task died before reaching the barrier.
+const BARRIER_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Creates a lab with a relay server.
 ///
@@ -27,12 +33,10 @@ const TEST_ALPN: &[u8] = b"test";
 pub(crate) async fn lab_with_relay(
     outdir: PathBuf,
 ) -> Result<(Lab, RelayMap, AbortOnDropHandle<()>, TestGuard)> {
-    let mut builder = Lab::builder().outdir(OutDir::Exact(outdir));
-    if let Some(name) = std::thread::current().name() {
-        builder = builder.label(name);
-    }
-    let lab = builder.build().await?;
-    let guard = lab.test_guard();
+    // `for_test` writes into `outdir`, labels the lab with the current thread
+    // (the test name under the default current-thread runtime), and returns the
+    // pass/fail guard.
+    let (lab, guard) = Lab::for_test(outdir).await?;
     let (relay_map, relay_guard) = spawn_relay(&lab).await?;
     Ok((lab, relay_map, relay_guard, guard))
 }
@@ -211,6 +215,10 @@ impl Pair {
         // `Endpoint::close` on both sides. `Endpoint::close` often takes several seconds,
         // which increases test runtime for all tests significantly, and closing behavior
         // should be tested for separately from the tests that use `Pair`.
+        //
+        // The barrier waits are bounded: a task that fails or panics before reaching the
+        // barrier would otherwise hang the healthy side until the nextest timeout kills
+        // the whole test instead of letting it report the failure.
         let barrier_server = Arc::new(Barrier::new(2));
         let barrier_client = barrier_server.clone();
 
@@ -247,7 +255,7 @@ impl Pair {
                 }
 
                 // Wait until the client run function completed before dropping the endpoint.
-                barrier_server.wait().await;
+                let _ = tokio::time::timeout(BARRIER_TIMEOUT, barrier_server.wait()).await;
                 for group in endpoint.metrics().groups() {
                     dev.record_iroh_metrics(group);
                 }
@@ -288,7 +296,7 @@ impl Pair {
                 }
 
                 // Wait until the server run function completed before dropping the endpoint.
-                barrier_client.wait().await;
+                let _ = tokio::time::timeout(BARRIER_TIMEOUT, barrier_client.wait()).await;
                 for group in endpoint.metrics().groups() {
                     dev.record_iroh_metrics(group);
                 }
@@ -434,7 +442,10 @@ fn watch_selected_path(conn: &Connection) {
     tokio::spawn(
         async move {
             while let Some(event) = events.next().await {
-                if let PathEvent::Selected { id, remote_addr } = event {
+                if let PathEvent::Selected {
+                    id, remote_addr, ..
+                } = event
+                {
                     debug!("selected path: [{id}] {remote_addr}");
                 }
             }
@@ -447,7 +458,7 @@ fn endpoint_builder(device: &Device, relay_map: RelayMap) -> iroh::endpoint::Bui
     #[allow(unused_mut)]
     let mut builder = Endpoint::builder(presets::Minimal)
         .relay_mode(RelayMode::Custom(relay_map))
-        .ca_roots_config(CaRootsConfig::insecure_skip_verify())
+        .ca_tls_config(CaTlsConfig::insecure_skip_verify())
         .alpns(vec![TEST_ALPN.to_vec()]);
 
     #[cfg(not(feature = "qlog"))]
@@ -472,14 +483,17 @@ fn addr_relay_only(addr: EndpointAddr) -> EndpointAddr {
     EndpointAddr::from_parts(addr.id, addr.addrs.into_iter().filter(|a| a.is_relay()))
 }
 
-mod relay {
-    use std::net::{IpAddr, Ipv6Addr};
+pub(crate) mod relay {
+    use std::{
+        net::{IpAddr, Ipv6Addr},
+        sync::Arc,
+    };
 
     use iroh_base::RelayUrl;
     use iroh_relay::{
         RelayConfig, RelayMap, RelayQuicConfig,
         server::{
-            AccessConfig, CertConfig, QuicConfig, RelayConfig as RelayServerConfig, Server,
+            AllowAll, CertConfig, QuicConfig, RelayConfig as RelayServerConfig, Server,
             ServerConfig, SpawnError, TlsConfig, testing::self_signed_tls_certs_and_config,
         },
     };
@@ -498,7 +512,7 @@ mod relay {
         let mut relay = RelayServerConfig::new((bind_ip, 80));
         relay.tls = Some(tls);
         relay.key_cache_capacity = Some(1024);
-        relay.access = AccessConfig::Everyone;
+        relay.access = Arc::new(AllowAll);
 
         let mut config = ServerConfig::default();
         config.relay = Some(relay);

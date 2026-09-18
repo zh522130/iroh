@@ -24,6 +24,13 @@ pub(crate) struct IpTransport {
     metrics: Arc<SocketMetrics>,
 }
 
+impl std::fmt::Display for IpTransport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let version = if self.config.is_ipv4() { "v4" } else { "v6" };
+        write!(f, "IpTransport({version})")
+    }
+}
+
 /// IP transport configuration
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) enum Config {
@@ -169,20 +176,16 @@ impl IpTransport {
         })?;
         let local_addr = socket.local_addr()?;
         debug!(%addr, %local_addr, "successfully bound");
-        Ok(Self::new(config, Arc::new(socket), metrics.clone()))
-    }
-
-    pub(crate) fn new(config: Config, socket: Arc<UdpSocket>, metrics: Arc<SocketMetrics>) -> Self {
         // Currently gets updated on manual rebind
         // TODO: update when UdpSocket under the hood rebinds automatically
-        let local_addr = Watchable::new(socket.local_addr().expect("invalid socket"));
+        let local_addr = Watchable::new(local_addr);
 
-        Self {
+        Ok(Self {
             config,
-            socket,
+            socket: Arc::new(socket),
             local_addr,
             metrics,
-        }
+        })
     }
 
     /// NOTE: Receiving on a closed socket will return [`Poll::Pending`] indefinitely.
@@ -469,33 +472,8 @@ impl IpTransports {
         })
     }
 
-    pub(super) fn poll_recv(
-        &mut self,
-        cx: &mut Context,
-        bufs: &mut [io::IoSliceMut<'_>],
-        metas: &mut [noq_udp::RecvMeta],
-        recv_infos: &mut [RecvInfo],
-    ) -> Poll<io::Result<usize>> {
-        macro_rules! poll_transport {
-            ($socket:expr) => {
-                match $socket.poll_recv(cx, bufs, metas, recv_infos)? {
-                    Poll::Pending | Poll::Ready(0) => {}
-                    Poll::Ready(n) => {
-                        return Poll::Ready(Ok(n));
-                    }
-                }
-            };
-        }
-
-        for transport in &mut self.v4 {
-            poll_transport!(transport);
-        }
-
-        for transport in &mut self.v6 {
-            poll_transport!(transport);
-        }
-
-        Poll::Pending
+    pub(super) fn iter_mut(&mut self) -> impl Iterator<Item = &mut IpTransport> {
+        self.v4.iter_mut().chain(self.v6.iter_mut())
     }
 }
 

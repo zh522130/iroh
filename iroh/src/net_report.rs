@@ -5,9 +5,6 @@
 //! etc and reachability to the configured relays.
 // Based on <https://github.com/tailscale/tailscale/blob/main/net/netcheck/netcheck.go>
 
-#![cfg_attr(iroh_docsrs, feature(doc_cfg))]
-#![deny(missing_docs, rustdoc::broken_intra_doc_links)]
-#![cfg_attr(not(test), deny(clippy::unwrap_used))]
 #![cfg_attr(wasm_browser, allow(unused))]
 
 use std::{
@@ -18,15 +15,11 @@ use std::{
 };
 
 use defaults::timeouts::PROBES_TIMEOUT;
-// exported primarily for use in documentation
-pub use defaults::timeouts::TIMEOUT;
 use iroh_base::RelayUrl;
 #[cfg(not(wasm_browser))]
 use iroh_dns::dns::DnsResolver;
 #[cfg(not(wasm_browser))]
-use iroh_relay::RelayConfig;
-#[cfg(not(wasm_browser))]
-use iroh_relay::quic::QuicClient;
+use iroh_relay::{RelayConfig, quic::QuicClient};
 use iroh_relay::{
     RelayMap,
     quic::{QUIC_ADDR_DISC_CLOSE_CODE, QUIC_ADDR_DISC_CLOSE_REASON},
@@ -46,19 +39,29 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, trace, warn};
 
-#[cfg(not(wasm_browser))]
-use self::reportgen::QadProbeReport;
 use self::reportgen::{ProbeFinished, ProbeReport};
+#[cfg(not(wasm_browser))]
+use self::reportgen::{QadProbeReport, SocketState};
+#[cfg_attr(not(feature = "unstable-net-report"), allow(unreachable_pub))]
+pub use self::{
+    // exported primarily for use in documentation
+    defaults::timeouts::TIMEOUT,
+    metrics::Metrics,
+    probes::Probe,
+    report::{RelayLatencies, Report},
+};
+pub(crate) use self::{
+    options::Options,
+    reportgen::{IfStateDetails, QuicConfig},
+};
 
 mod defaults;
 mod metrics;
+mod options;
 mod probes;
 mod report;
 mod reportgen;
 
-mod options;
-
-pub(crate) use self::reportgen::IfStateDetails;
 #[cfg(not(wasm_browser))]
 #[allow(missing_docs)]
 #[stack_error(derive, add_meta)]
@@ -76,12 +79,55 @@ enum QadProbeError {
     ReceiverDropped,
 }
 
-#[cfg(not(wasm_browser))]
-use self::reportgen::SocketState;
-pub use self::{metrics::Metrics, report::Report};
-pub(crate) use self::{
-    options::Options, probes::Probe, report::RelayLatencies, reportgen::QuicConfig,
-};
+/// Configuration for the net report component.
+///
+/// Controls which probes and checks are performed when generating network reports.
+/// All options default to `true`.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct NetReportConfig {
+    /// Run HTTPS latency probes against relay servers.
+    ///
+    /// HTTPS latency probes perform an empty HTTPS GET request to each configured
+    /// relay server and measure latency.
+    ///
+    /// They are performed in addition to the QUIC address discovery (QAD) probes.
+    /// In networks that do not allow QUIC traffic, they are the only way to detect
+    /// relay latencies and thus the preferred relay.
+    ///
+    /// Disabling them is harmless on networks that do allow QUIC traffic, but will
+    /// completely prevent finding the home relay on networks that do block QUIC.
+    pub https_probes: bool,
+
+    /// Check for captive portals when generating the first report.
+    ///
+    /// This is done by accessing a well-known URL that is available on each relay
+    /// server, `/generate_204`. If a GET request to this URL returns anything else
+    /// but a 204 No Content response, we assume we are behind a captive portal.
+    ///
+    /// When we have detected that we are behind a captive portal, we try to contact
+    /// the relay servers more frequently in case the captive portal status changes.
+    pub captive_portal_check: bool,
+}
+
+impl NetReportConfig {
+    /// Creates a minimal configuration that disables all optional probes and checks.
+    pub fn minimal() -> Self {
+        Self {
+            https_probes: false,
+            captive_portal_check: false,
+        }
+    }
+}
+
+impl Default for NetReportConfig {
+    fn default() -> Self {
+        Self {
+            https_probes: true,
+            captive_portal_check: true,
+        }
+    }
+}
 
 const FULL_REPORT_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const ENOUGH_ENDPOINTS: usize = 3;
@@ -98,6 +144,8 @@ pub(crate) struct Client {
     qad_conns: QadConns,
     #[cfg(not(wasm_browser))]
     tls_config: rustls::ClientConfig,
+    /// Whether to check for captive portals.
+    captive_portal_check: bool,
     /// A collection of previously generated reports.
     ///
     /// Sometimes it is useful to look at past reports to decide what to do.
@@ -224,6 +272,7 @@ impl Client {
         let socket_state = SocketState {
             quic_client,
             dns_resolver,
+            proxy_url: opts.proxy_url,
         };
 
         Client {
@@ -237,6 +286,7 @@ impl Client {
             qad_conns: QadConns::default(),
             #[cfg(not(wasm_browser))]
             tls_config: opts.tls_config,
+            captive_portal_check: opts.user_config.captive_portal_check,
         }
     }
 
@@ -292,6 +342,7 @@ impl Client {
             self.reports.last.clone(),
             self.relay_map.clone(),
             self.probes.clone(),
+            self.captive_portal_check,
             if_state.clone(),
             shutdown_token.child_token(),
             #[cfg(not(wasm_browser))]
@@ -396,7 +447,7 @@ impl Client {
         do_full: bool,
         shutdown_token: CancellationToken,
     ) -> Vec<ProbeReport> {
-        use tracing::{Instrument, warn_span};
+        use tracing::{Instrument, info_span};
 
         let Some(ref quic_client) = self.socket_state.quic_client else {
             return Vec::new();
@@ -466,7 +517,7 @@ impl Client {
                             PROBES_TIMEOUT,
                             run_probe_v4(relay, quic_client, dns_resolver, inner_token),
                         ))
-                        .instrument(warn_span!("QADv4", %relay_url)),
+                        .instrument(info_span!("QADv4", %relay_url)),
                 );
             }
             if if_state.have_v6 && needs_v6_probe {
@@ -483,7 +534,7 @@ impl Client {
                             PROBES_TIMEOUT,
                             run_probe_v6(relay, quic_client, dns_resolver, inner_token),
                         ))
-                        .instrument(warn_span!("QADv6", %relay_url)),
+                        .instrument(info_span!("QADv6", %relay_url)),
                 );
             }
         }
@@ -516,7 +567,7 @@ impl Client {
                 }
 
                 val = v4_buf.join_next(), if !v4_buf.is_empty() => {
-                    let span = warn_span!("QADv4");
+                    let span = info_span!("QADv4");
                     let _guard = span.enter();
                     ipv4_pending = false;
                     match val {
@@ -555,7 +606,7 @@ impl Client {
                     }
                 }
                 val = v6_buf.join_next(), if !v6_buf.is_empty() => {
-                    let span = warn_span!("QADv6");
+                    let span = info_span!("QADv6");
                     let _guard = span.enter();
                     ipv6_pending = false;
                     match val {
@@ -950,7 +1001,7 @@ mod tests {
 
     use iroh_base::RelayUrl;
     use iroh_dns::dns::DnsResolver;
-    use iroh_relay::tls::{CaRootsConfig, default_provider};
+    use iroh_relay::tls::{CaTlsConfig, default_provider};
     use n0_error::{Result, StdResultExt};
     use n0_tracing_test::traced_test;
     use tokio_util::sync::CancellationToken;
@@ -973,7 +1024,7 @@ mod tests {
         let relay_map = RelayMap::from(relay);
 
         let resolver = DnsResolver::new();
-        let tls_config = CaRootsConfig::insecure_skip_verify()
+        let tls_config = CaTlsConfig::insecure_skip_verify()
             .client_config(default_provider())
             .expect("infallible");
         let opts = Options::new(tls_config).quic_config(Some(quic_addr_disc.clone()));
@@ -1177,7 +1228,7 @@ mod tests {
             },
         ];
         let resolver = DnsResolver::new();
-        let tls_config = CaRootsConfig::insecure_skip_verify()
+        let tls_config = CaTlsConfig::insecure_skip_verify()
             .client_config(default_provider())
             .expect("infallible");
         for mut tt in tests {

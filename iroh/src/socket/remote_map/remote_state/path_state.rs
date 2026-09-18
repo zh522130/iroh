@@ -166,6 +166,11 @@ impl RemotePathState {
         }
     }
 
+    /// Returns `true` if there are any queued resolve requests from [`Self::resolve_remote`].
+    pub(super) fn resolve_requests_is_empty(&self) -> bool {
+        self.pending_resolve_requests.is_empty()
+    }
+
     /// Notifies that a Address Lookup run has finished.
     ///
     /// This will emit pending resolve requests.
@@ -215,9 +220,9 @@ impl RemotePathState {
 /// The state of a single path to the remote endpoint.
 ///
 /// Each path is identified by the destination [`transports::Addr`] and they are stored in
-/// the [`RemotePathState`] map at [`RemoteStateActor::paths`].
+/// the [`RemotePathState`] map in [`RemoteStateActor`].
 ///
-/// [`RemoteStateActor::paths`]: super::RemoteStateActor::paths
+/// [`RemoteStateActor`]: super::RemoteStateActor
 #[derive(Debug, Default)]
 pub(super) struct PathState {
     /// How we learned about this path, and when.
@@ -245,7 +250,9 @@ pub(super) struct PathState {
 ///
 /// - We do not have unbounded growth of paths.
 /// - If we have many paths for this remote, we prune the paths that cannot hole punch.
-/// - We do not prune holepunched paths that are currently not in use too quickly. For example, if a large number of untested paths are added at once, we will not immediately prune all of the unused, but valid, paths at once.
+/// - We do not prune holepunched paths that are currently not in use too quickly. For
+///   example, if a large number of untested paths are added at once, we will not
+///   immediately prune all of the unused, but valid, paths at once.
 fn prune_non_relay_paths(paths: &mut FxHashMap<transports::Addr, PathState>) {
     // if the total number of paths is less than the max, bail early
     if paths.len() < MAX_NON_RELAY_PATHS {
