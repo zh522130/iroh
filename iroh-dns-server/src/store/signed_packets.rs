@@ -170,7 +170,7 @@ impl Actor {
                             // remove the old packet from the update time index
                             tables
                                 .update_time
-                                .remove(&existing.timestamp().to_be_bytes(), key.as_bytes())
+                                .remove(existing.timestamp().to_be_bytes(), key.as_bytes())
                                 .anyerr()?;
                             true
                         }
@@ -184,7 +184,7 @@ impl Actor {
                     .anyerr()?;
                 tables
                     .update_time
-                    .insert(&packet.timestamp().to_be_bytes(), key.as_bytes())
+                    .insert(packet.timestamp().to_be_bytes(), key.as_bytes())
                     .anyerr()?;
                 if replaced {
                     self.metrics.store_packets_updated.inc();
@@ -201,7 +201,7 @@ impl Actor {
                         let packet = deserialize(row.value())?;
                         tables
                             .update_time
-                            .remove(&packet.timestamp().to_be_bytes(), key.as_bytes())
+                            .remove(packet.timestamp().to_be_bytes(), key.as_bytes())
                             .anyerr()?;
                         self.metrics.store_packets_removed.inc();
                         true
@@ -225,7 +225,7 @@ impl Actor {
                         if packet.timestamp() < expired {
                             tables
                                 .update_time
-                                .remove(&time.to_be_bytes(), key.as_bytes())
+                                .remove(time.to_be_bytes(), key.as_bytes())
                                 .anyerr()?;
                             let _ = tables.signed_packets.remove(key.as_bytes()).anyerr()?;
                             self.metrics.store_packets_expired.inc();
@@ -236,7 +236,7 @@ impl Actor {
                             );
                             tables
                                 .update_time
-                                .remove(&time.to_be_bytes(), key.as_bytes())
+                                .remove(time.to_be_bytes(), key.as_bytes())
                                 .anyerr()?;
                         }
                     }
@@ -244,7 +244,7 @@ impl Actor {
                         debug!("expired packet {key} not found, remove from expiry table");
                         tables
                             .update_time
-                            .remove(&time.to_be_bytes(), key.as_bytes())
+                            .remove(time.to_be_bytes(), key.as_bytes())
                             .anyerr()?;
                     }
                 }
