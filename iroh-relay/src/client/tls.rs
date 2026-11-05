@@ -9,7 +9,7 @@
 use std::{collections::VecDeque, net::IpAddr};
 
 use bytes::Bytes;
-use data_encoding::BASE64URL;
+use data_encoding::BASE64;
 use http_body_util::Empty;
 use hyper::{Request, upgrade::Parts};
 use hyper_util::rt::TokioIo;
@@ -18,6 +18,7 @@ use n0_future::{
     FuturesUnordered, MaybeFuture, StreamExt, task,
     time::{self},
 };
+use percent_encoding::percent_decode_str;
 use rustls::client::Resumption;
 use tokio::net::TcpStream;
 use tracing::{Instrument, error, info_span};
@@ -130,7 +131,7 @@ impl MaybeTlsStreamBuilder {
         tls_connector: &tokio_rustls::TlsConnector,
     ) -> Result<util::Chain<std::io::Cursor<Bytes>, MaybeTlsStream<tokio::net::TcpStream>>, DialError>
     {
-        debug!(%self.url, %proxy_url, "dial url via proxy");
+        debug!(%self.url, proxy_url = %with_password_masked(&proxy_url), "dial url via proxy");
 
         let tcp_stream = dial_happy_eyeballs(&self.dns_resolver, &proxy_url, self.prefer_ipv6)
             .await
@@ -180,13 +181,16 @@ impl MaybeTlsStreamBuilder {
                 "setting proxy-authorization: username={}",
                 proxy_url.username()
             );
-            let to_encode = format!(
-                "{}:{}",
-                proxy_url.username(),
-                proxy_url.password().unwrap_or_default()
-            );
-            let encoded = BASE64URL.encode(to_encode.as_bytes());
-            req_builder = req_builder.header("Proxy-Authorization", format!("Basic {encoded}"));
+            // `Url` keeps the username and password percent-encoded.
+            let mut to_encode: Vec<u8> = percent_decode_str(proxy_url.username()).collect();
+            to_encode.push(b':');
+            to_encode.extend(percent_decode_str(proxy_url.password().unwrap_or_default()));
+            let encoded = BASE64.encode(&to_encode);
+            let mut value = http::HeaderValue::try_from(format!("Basic {encoded}"))
+                .expect("base64 is a valid header value");
+            // Keeps the credentials out of the request's `Debug` output.
+            value.set_sensitive(true);
+            req_builder = req_builder.header("Proxy-Authorization", value);
         }
         let req = req_builder
             .body(Empty::<Bytes>::new())
@@ -374,6 +378,16 @@ fn url_port(url: &Url) -> Option<u16> {
     }
 }
 
+/// Returns `url` with its password, if it has one, replaced by `***`, so it can be logged.
+fn with_password_masked(url: &Url) -> Url {
+    let mut url = url.clone();
+    if url.password().is_some() {
+        // Cannot fail: a URL that has a password can have one set.
+        url.set_password(Some("***")).ok();
+    }
+    url
+}
+
 #[cfg(test)]
 mod tests {
     use std::net::{Ipv4Addr, Ipv6Addr};
@@ -446,5 +460,94 @@ mod tests {
             .await
             .expect_err("no addresses to dial");
         assert!(matches!(err, DialError::Dns { .. }));
+    }
+
+    /// Dials through a fake proxy with the given userinfo and returns the
+    /// `Proxy-Authorization` header the proxy received.
+    ///
+    /// The proxy reads the `CONNECT` request and hangs up, so the dial fails.
+    #[cfg(with_crypto_provider)]
+    async fn proxy_authorization_for(userinfo: &str) -> String {
+        use std::time::Duration;
+
+        use tokio::io::AsyncReadExt;
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let proxy = task::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut head = Vec::new();
+            while !head.ends_with(b"\r\n\r\n") {
+                head.push(stream.read_u8().await.unwrap());
+            }
+            String::from_utf8(head).unwrap()
+        });
+
+        let proxy_url = format!("http://{userinfo}@proxy.test:{port}")
+            .parse()
+            .expect("valid url");
+        let resolver = static_resolver(vec![Ipv4Addr::LOCALHOST], vec![]);
+        let res = MaybeTlsStreamBuilder::new(
+            relay_url(443),
+            resolver,
+            crate::tls::make_dangerous_client_config(),
+        )
+        .proxy_url(Some(proxy_url))
+        .connect()
+        .await;
+        assert!(res.is_err(), "the proxy never opens the tunnel");
+
+        let head = time::timeout(Duration::from_secs(5), proxy)
+            .await
+            .expect("the proxy received no request")
+            .unwrap();
+        head.lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("proxy-authorization")
+                    .then(|| value.trim().to_string())
+            })
+            .expect("no Proxy-Authorization header")
+    }
+
+    /// Tests that the proxy credentials use the standard base64 alphabet (RFC 7617).
+    #[cfg(with_crypto_provider)]
+    #[tokio::test]
+    async fn proxy_authorization_uses_standard_base64() {
+        // The URL-safe alphabet gives "dXNlcjpzM2NyZXR-fg==".
+        assert_eq!(
+            proxy_authorization_for("user:s3cret~~").await,
+            "Basic dXNlcjpzM2NyZXR+fg=="
+        );
+    }
+
+    /// Tests that the proxy credentials are percent-decoded before they are encoded.
+    #[cfg(with_crypto_provider)]
+    #[tokio::test]
+    async fn proxy_authorization_decodes_credentials() {
+        // `Url` keeps these passwords as "s3cret%3E%3E" and "p%40ss".
+        assert_eq!(
+            proxy_authorization_for("user:s3cret>>").await,
+            "Basic dXNlcjpzM2NyZXQ+Pg=="
+        );
+        assert_eq!(
+            proxy_authorization_for("user:p%40ss").await,
+            "Basic dXNlcjpwQHNz"
+        );
+    }
+
+    /// Tests that the proxy password stays out of the debug log, in the proxy
+    /// URL and in the `Proxy-Authorization` header, while the username is kept.
+    #[cfg(with_crypto_provider)]
+    #[tokio::test]
+    #[n0_tracing_test::traced_test]
+    async fn proxy_credentials_are_not_logged() {
+        proxy_authorization_for("user:s3cret").await;
+        assert!(logs_contain("dial url via proxy"));
+        assert!(logs_contain("Sending proxy request"));
+        assert!(logs_contain("user:***@proxy.test"));
+        assert!(!logs_contain("s3cret"));
+        // "user:s3cret" in base64.
+        assert!(!logs_contain("dXNlcjpzM2NyZXQ="));
     }
 }
